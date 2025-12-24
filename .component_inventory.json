@@ -1,0 +1,117 @@
+{
+  "timestamp": "2025-12-16T07:21:31.309870",
+  "root_files": {
+    "app_refactored.py": {
+      "exists": true,
+      "size": 77993,
+      "modified": "2025-12-16T06:23:41.320420"
+    },
+    "db_connector.py": {
+      "exists": true,
+      "size": 44296,
+      "modified": "2025-12-15T08:31:16.862304"
+    },
+    "supabase_utils.py": {
+      "exists": true,
+      "size": 1569,
+      "modified": "2025-12-15T08:31:16.864169"
+    },
+    "funding_engine.py": {
+      "exists": true,
+      "size": 36650,
+      "modified": "2025-12-15T08:52:38.733949"
+    },
+    "linear_theme.py": {
+      "exists": true,
+      "size": 14573,
+      "modified": "2025-12-15T08:55:19.681581"
+    }
+  },
+  "components": {
+    "ai_assumptions_engine": {
+      "exists": true,
+      "size": 71471,
+      "modified": "2025-12-15T08:52:03.804336"
+    },
+    "ai_assumptions_integration": {
+      "exists": true,
+      "size": 9762,
+      "modified": "2025-12-15T07:36:19.655072"
+    },
+    "ai_trend_analysis": {
+      "exists": true,
+      "size": 57760,
+      "modified": "2025-12-15T08:52:02.765777"
+    },
+    "column_mapper": {
+      "exists": true,
+      "size": 72189,
+      "modified": "2025-12-15T09:37:57.586312"
+    },
+    "command_center": {
+      "exists": true,
+      "size": 21075,
+      "modified": "2025-12-15T08:42:02.154929"
+    },
+    "enhanced_navigation": {
+      "exists": true,
+      "size": 7655,
+      "modified": "2025-12-15T08:31:54.819028"
+    },
+    "financial_statements": {
+      "exists": true,
+      "size": 87857,
+      "modified": "2025-12-15T07:36:19.655409"
+    },
+    "forecast_section": {
+      "exists": true,
+      "size": 204087,
+      "modified": "2025-12-15T08:25:39.657724"
+    },
+    "funding_ui": {
+      "exists": true,
+      "size": 33809,
+      "modified": "2025-12-15T08:52:04.895834"
+    },
+    "scenario_comparison": {
+      "exists": true,
+      "size": 18848,
+      "modified": "2025-12-15T07:36:19.655424"
+    },
+    "setup_wizard": {
+      "exists": true,
+      "size": 46072,
+      "modified": "2025-12-15T08:52:10.489569"
+    },
+    "ui_components": {
+      "exists": true,
+      "size": 20838,
+      "modified": "2025-12-15T08:55:19.681643"
+    },
+    "user_management": {
+      "exists": true,
+      "size": 30791,
+      "modified": "2025-12-15T08:52:12.336267"
+    },
+    "vertical_integration": {
+      "exists": true,
+      "size": 124230,
+      "modified": "2025-12-16T06:23:41.321740"
+    },
+    "whatif_agent": {
+      "exists": true,
+      "size": 4181,
+      "modified": "2025-12-16T06:10:47.670135"
+    },
+    "workflow_guidance": {
+      "exists": true,
+      "size": 4644,
+      "modified": "2025-12-16T06:10:47.669483"
+    },
+    "workflow_navigator": {
+      "exists": true,
+      "size": 3205,
+      "modified": "2025-12-16T06:10:47.670198"
+    }
+  }
+}

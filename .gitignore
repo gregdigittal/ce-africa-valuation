@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment Variables (CRITICAL)
+.env
+.streamlit/secrets.toml
+
+# Cursor/IDE
+.cursor/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Local data imports (do not commit)
+CE Imports/
+Historic Sales/
+
+# Legacy/backup codebases (do not commit)
+.backups/
+ce-africa-valuation-Sprint16Final/
+ce-africa-valuation-Sprint16/
+
+# Any nested Streamlit secrets
+**/.streamlit/secrets.toml
