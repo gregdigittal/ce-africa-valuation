@@ -4754,25 +4754,42 @@ Best when you have reliable historical financials and want trend-driven forecast
                             st.caption(f"Snapshot saved: {snapshot_id}")
                             if st.button("Load snapshot into UI", use_container_width=True, key=f"load_api_snapshot_{snapshot_id}"):
                                 try:
-                                    snap = (
-                                        db.client.table("forecast_snapshots")
-                                        .select("forecast_data, monte_carlo_data, valuation_data, enterprise_value")
-                                        .eq("id", snapshot_id)
-                                        .limit(1)
-                                        .execute()
-                                    )
-                                    if snap.data and snap.data[0].get("forecast_data"):
-                                        st.session_state["forecast_results"] = snap.data[0]["forecast_data"]
-                                        if snap.data[0].get("monte_carlo_data"):
-                                            st.session_state["mc_results"] = snap.data[0]["monte_carlo_data"]
-                                        if snap.data[0].get("valuation_data"):
-                                            st.session_state["valuation_data"] = snap.data[0]["valuation_data"]
-                                        if snap.data[0].get("enterprise_value") is not None:
-                                            st.session_state["enterprise_value"] = snap.data[0]["enterprise_value"]
-                                        st.success("Loaded snapshot into UI.")
+                                    # Prefer API snapshot endpoint (keeps UI thin).
+                                    snap_api_url = urljoin(api_base_url, f"v1/snapshots/{snapshot_id}?user_id={user_id}")
+                                    snap_row = _http_json("GET", snap_api_url, payload=None, timeout=30)
+
+                                    forecast_data = snap_row.get("forecast_data") if isinstance(snap_row, dict) else None
+                                    if forecast_data:
+                                        st.session_state["forecast_results"] = forecast_data
+                                        if snap_row.get("monte_carlo_data"):
+                                            st.session_state["mc_results"] = snap_row.get("monte_carlo_data")
+                                        if snap_row.get("valuation_data"):
+                                            st.session_state["valuation_data"] = snap_row.get("valuation_data")
+                                        if snap_row.get("enterprise_value") is not None:
+                                            st.session_state["enterprise_value"] = snap_row.get("enterprise_value")
+                                        st.success("Loaded snapshot into UI (via API).")
                                         st.rerun()
                                     else:
-                                        st.error("Snapshot found but forecast_data was empty.")
+                                        # Fallback: load directly from DB (legacy behavior)
+                                        snap = (
+                                            db.client.table("forecast_snapshots")
+                                            .select("forecast_data, monte_carlo_data, valuation_data, enterprise_value")
+                                            .eq("id", snapshot_id)
+                                            .limit(1)
+                                            .execute()
+                                        )
+                                        if snap.data and snap.data[0].get("forecast_data"):
+                                            st.session_state["forecast_results"] = snap.data[0]["forecast_data"]
+                                            if snap.data[0].get("monte_carlo_data"):
+                                                st.session_state["mc_results"] = snap.data[0]["monte_carlo_data"]
+                                            if snap.data[0].get("valuation_data"):
+                                                st.session_state["valuation_data"] = snap.data[0]["valuation_data"]
+                                            if snap.data[0].get("enterprise_value") is not None:
+                                                st.session_state["enterprise_value"] = snap.data[0]["enterprise_value"]
+                                            st.success("Loaded snapshot into UI (via DB fallback).")
+                                            st.rerun()
+                                        else:
+                                            st.error("Snapshot found but forecast_data was empty.")
                                 except Exception as e:
                                     st.error(f"Failed to load snapshot: {e}")
                     elif compact and isinstance(compact, dict) and not compact.get("success", True):

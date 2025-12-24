@@ -113,3 +113,47 @@ class SupabaseAPIHandler:
         except Exception:
             return None
 
+    def list_snapshots(self, scenario_id: str, user_id: str, limit: int = 20) -> list[Dict[str, Any]]:
+        """
+        List snapshots for a scenario, scoped to a user.
+        """
+        try:
+            resp = (
+                self.client.table("forecast_snapshots")
+                .select(
+                    "id,snapshot_name,snapshot_date,snapshot_type,created_at,"
+                    "total_revenue_forecast,total_gross_profit_forecast,enterprise_value,is_locked"
+                )
+                .eq("scenario_id", scenario_id)
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .limit(int(limit))
+                .execute()
+            )
+            return resp.data or []
+        except Exception:
+            return []
+
+    def get_snapshot(self, snapshot_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Load a snapshot by id, scoped to a user.
+        """
+        try:
+            resp = (
+                self.client.table("forecast_snapshots")
+                .select(
+                    "id,scenario_id,user_id,snapshot_name,snapshot_date,snapshot_type,created_at,"
+                    "assumptions_data,forecast_data,monte_carlo_data,valuation_data,enterprise_value,summary_stats,"
+                    "total_revenue_forecast,total_gross_profit_forecast,is_locked,notes"
+                )
+                .eq("id", snapshot_id)
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            if resp.data:
+                return resp.data[0]
+            return None
+        except Exception:
+            return None
+
