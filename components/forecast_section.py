@@ -904,6 +904,41 @@ def _get_monthly_sales_pattern(db, scenario_id: str) -> Optional[np.ndarray]:
         12-element array with monthly weights, or None if no pattern found
     """
     try:
+        # Prefer: granular sales history (invoice-level). This table is user-scoped (not scenario-scoped).
+        if hasattr(db, 'client'):
+            try:
+                scen = db.client.table('scenarios').select('user_id').eq('id', scenario_id).limit(1).execute()
+                scen_user_id = None
+                if scen.data and scen.data[0].get('user_id'):
+                    scen_user_id = scen.data[0]['user_id']
+
+                if scen_user_id:
+                    resp = db.client.table('granular_sales_history').select(
+                        'date, quantity, unit_price_sold'
+                    ).eq('user_id', scen_user_id).execute()
+
+                    if resp.data and len(resp.data) >= 12:
+                        sdf = pd.DataFrame(resp.data)
+                        sdf['date'] = pd.to_datetime(sdf['date'], errors='coerce')
+                        sdf = sdf.dropna(subset=['date'])
+                        if not sdf.empty:
+                            sdf['month'] = sdf['date'].dt.month
+                            sdf['quantity'] = pd.to_numeric(sdf.get('quantity'), errors='coerce').fillna(0.0)
+                            sdf['unit_price_sold'] = pd.to_numeric(sdf.get('unit_price_sold'), errors='coerce').fillna(0.0)
+                            sdf['sales'] = sdf['quantity'] * sdf['unit_price_sold']
+
+                            monthly = sdf.groupby('month')['sales'].sum()
+                            # Need at least 6 months with activity to avoid noisy patterns
+                            active_months = int((monthly > 0).sum())
+                            if active_months >= 6:
+                                pattern = np.zeros(12)
+                                for m in range(1, 13):
+                                    pattern[m - 1] = float(monthly.get(m, 0.0))
+                                if pattern.sum() > 0:
+                                    return pattern / pattern.sum()
+            except Exception:
+                pass
+
         # Try 1: Look for monthly sales data in dedicated table
         if hasattr(db, 'client'):
             try:
@@ -4587,7 +4622,7 @@ Best when you have reliable historical financials and want trend-driven forecast
         ).rstrip("/") + "/"
         st.caption("API job runner executes forecasts in the background (no in-app progress bar).")
         if include_monte_carlo:
-            st.info("Monte Carlo is not wired to API mode yet (Local mode only).")
+            st.info("Monte Carlo will be run in the API job and saved into the snapshot.")
         if include_manufacturing:
             st.info("Manufacturing scenario will be passed to the API job (requires it to be configured).")
     
