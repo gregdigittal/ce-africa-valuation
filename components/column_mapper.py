@@ -2325,10 +2325,19 @@ def render_import_with_mapping(
                                 index=selected_years.index(latest_year) if latest_year in selected_years else 0,
                                 key=f"{import_type}_ytd_year",
                             )
+                            # Default the YTD end month to the latest selected period's calendar month.
+                            # This prevents accidental "Nov is forecast" behaviour when the latest period
+                            # is November but the UI default (Oct) is left unchanged.
+                            try:
+                                _latest_dt = pd.to_datetime(latest_period) if latest_period is not None else None
+                                _default_ytd_end_month = int(_latest_dt.month) if _latest_dt is not None and pd.notna(_latest_dt) else 10
+                            except Exception:
+                                _default_ytd_end_month = 10
+                            _ytd_end_options = list(range(1, 13))
                             ytd_end_month = st.selectbox(
                                 "YTD ends at month (calendar month)",
-                                options=list(range(1, 13)),
-                                index=9,  # default Oct
+                                options=_ytd_end_options,
+                                index=_ytd_end_options.index(_default_ytd_end_month),
                                 format_func=lambda m: datetime(2000, m, 1).strftime('%b'),
                                 key=f"{import_type}_ytd_end_month",
                                 help="This is the calendar month in which the YTD statement is cut off (e.g., Oct)."

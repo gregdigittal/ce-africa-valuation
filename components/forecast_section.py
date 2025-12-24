@@ -2293,7 +2293,9 @@ def build_monthly_financials(
     if not timeline:
         return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
     
-    # Use the latest historical date (if available) to anchor YTD; fallback to now
+    # Use the latest historical date (if available) to anchor YTD; fallback to now.
+    # IMPORTANT: Don't override this later with datetime.now() — YTD should reflect the
+    # latest imported actual month for the scenario (especially right after import).
     from datetime import datetime
     from dateutil.relativedelta import relativedelta
     if historical_data is not None and not historical_data.empty and 'period_date' in historical_data.columns:
@@ -2343,13 +2345,8 @@ def build_monthly_financials(
     total_rev_arr = forecast_result.get('revenue', {}).get('total', [])
     cogs_arr = forecast_result.get('costs', {}).get('cogs', [])
     opex_arr = forecast_result.get('costs', {}).get('opex', [])
-    
-    # Get current date to identify current year and month
-    from datetime import datetime
-    from dateutil.relativedelta import relativedelta
-    current_date = datetime.now()
-    current_year = current_date.year
-    current_month = current_date.month
+    # NOTE: keep using current_year/current_month anchored above (latest historical period)
+    # so we don't mistakenly treat an already-imported month as "missing".
     
     # Check if we have historical data for current month or any YTD months
     has_current_month_actual = False
@@ -2424,7 +2421,24 @@ def build_monthly_financials(
             if not ytd_df.empty:
                 max_month = int(ytd_df['period_month'].max())
                 if max_month < 12:
-                    months_to_fill = list(range(max_month + 1, 13))
+                    # Fill only months that are actually missing.
+                    # This prevents cases where a month exists in imported actuals
+                    # but is still being treated as a forecast fill month.
+                    existing_periods = set()
+                    for r in all_rows:
+                        try:
+                            y = r.get('period_year')
+                            m = r.get('period_month')
+                            if y is None or m is None:
+                                continue
+                            existing_periods.add((int(y), int(m)))
+                        except Exception:
+                            continue
+
+                    months_to_fill = [
+                        m for m in range(max_month + 1, 13)
+                        if (int(current_year), int(m)) not in existing_periods
+                    ]
                     numeric_means = ytd_df.select_dtypes(include=[np.number]).mean().fillna(0)
                     for m in months_to_fill:
                         filler_date = datetime(current_year, m, 1)
