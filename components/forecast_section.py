@@ -4622,6 +4622,11 @@ Best when you have reliable historical financials and want trend-driven forecast
                     compact = job_result.get("result") if isinstance(job_result, dict) else None
                     if compact and isinstance(compact, dict) and compact.get("success"):
                         st.success("✅ API forecast finished successfully (preview payload).")
+                        if isinstance(job_result, dict) and job_result.get("enterprise_value") is not None:
+                            try:
+                                st.metric("Enterprise Value (API)", format_currency(float(job_result.get("enterprise_value") or 0)))
+                            except Exception:
+                                pass
                         snapshot_id = job_result.get("snapshot_id") if isinstance(job_result, dict) else None
                         if snapshot_id:
                             st.caption(f"Snapshot saved: {snapshot_id}")
@@ -4629,7 +4634,7 @@ Best when you have reliable historical financials and want trend-driven forecast
                                 try:
                                     snap = (
                                         db.client.table("forecast_snapshots")
-                                        .select("forecast_data, monte_carlo_data")
+                                        .select("forecast_data, monte_carlo_data, valuation_data, enterprise_value")
                                         .eq("id", snapshot_id)
                                         .limit(1)
                                         .execute()
@@ -4638,6 +4643,10 @@ Best when you have reliable historical financials and want trend-driven forecast
                                         st.session_state["forecast_results"] = snap.data[0]["forecast_data"]
                                         if snap.data[0].get("monte_carlo_data"):
                                             st.session_state["mc_results"] = snap.data[0]["monte_carlo_data"]
+                                        if snap.data[0].get("valuation_data"):
+                                            st.session_state["valuation_data"] = snap.data[0]["valuation_data"]
+                                        if snap.data[0].get("enterprise_value") is not None:
+                                            st.session_state["enterprise_value"] = snap.data[0]["enterprise_value"]
                                         st.success("Loaded snapshot into UI.")
                                         st.rerun()
                                     else:

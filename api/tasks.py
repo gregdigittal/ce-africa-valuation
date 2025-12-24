@@ -7,6 +7,7 @@ from api.forecast_data import load_forecast_data_api
 from api.monte_carlo import run_monte_carlo_simple
 from api.supabase_handler import SupabaseAPIHandler
 from api.serialize import to_jsonable
+from api.valuation import run_dcf_valuation
 from forecast_engine import ForecastEngine
 
 
@@ -85,6 +86,17 @@ def run_forecast_task(
             progress_callback=None,
         )
 
+    # Deterministic valuation (DCF)
+    valuation_data: Optional[Dict[str, Any]] = None
+    enterprise_value: Optional[float] = None
+    if bool(options.get("run_valuation", True)):
+        try:
+            valuation_data_raw, ev = run_dcf_valuation(results, data.get("assumptions") or {}, net_debt=float(options.get("net_debt", 0.0) or 0.0))
+            valuation_data = to_jsonable(valuation_data_raw)  # type: ignore[assignment]
+            enterprise_value = float(ev)
+        except Exception:
+            valuation_data = {"error": "valuation_failed"}
+
     # Persist as snapshot (preferred transport for big payloads)
     snapshot_name = str(options.get("snapshot_name") or f"API Forecast {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     snapshot_type = str(options.get("snapshot_type") or "base")
@@ -101,6 +113,8 @@ def run_forecast_task(
         assumptions_data=assumptions_data if isinstance(assumptions_data, dict) else {"value": assumptions_data},
         forecast_data=forecast_data if isinstance(forecast_data, dict) else {"value": forecast_data},
         monte_carlo_data=monte_carlo_data if isinstance(monte_carlo_data, dict) else ({"value": monte_carlo_data} if monte_carlo_data is not None else None),
+        valuation_data=valuation_data if isinstance(valuation_data, dict) else ({"value": valuation_data} if valuation_data is not None else None),
+        enterprise_value=enterprise_value,
     )
 
     return {
@@ -119,6 +133,8 @@ def run_forecast_task(
             if isinstance(mc_results, dict)
             else None
         ),
+        "valuation": valuation_data,
+        "enterprise_value": enterprise_value,
         "snapshot_id": snapshot_id,
     }
 

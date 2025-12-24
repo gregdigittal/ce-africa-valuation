@@ -75,6 +75,8 @@ class SupabaseAPIHandler:
         assumptions_data: Dict[str, Any],
         forecast_data: Dict[str, Any],
         monte_carlo_data: Optional[Dict[str, Any]] = None,
+        valuation_data: Optional[Dict[str, Any]] = None,
+        enterprise_value: Optional[float] = None,
         snapshot_date: Optional[date] = None,
     ) -> Optional[str]:
         """
@@ -96,6 +98,10 @@ class SupabaseAPIHandler:
             }
             if monte_carlo_data is not None:
                 payload["monte_carlo_data"] = monte_carlo_data
+            if valuation_data is not None:
+                payload["valuation_data"] = valuation_data
+            if enterprise_value is not None:
+                payload["enterprise_value"] = float(enterprise_value)
             if snapshot_date is not None:
                 payload["snapshot_date"] = snapshot_date.isoformat()
 
