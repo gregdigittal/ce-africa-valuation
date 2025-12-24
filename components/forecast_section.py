@@ -1966,13 +1966,9 @@ def save_snapshot(
         # Build the insert data
         # IMPORTANT:
         # - forecast_snapshots columns are JSONB in Supabase; store dicts, not json.dumps() strings.
-        # - This keeps API-mode and Streamlit-mode snapshots consistent.
-        forecast_blob = {
-            'timeline': serializable_results.get('timeline', []),
-            'revenue': serializable_results.get('revenue', {}),
-            'costs': serializable_results.get('costs', {}),
-            'profit': serializable_results.get('profit', {})
-        }
+        # - Store the FULL forecast payload so downstream features (What-If) can re-use assumptions.
+        # - Still keep summary_stats as its own JSONB for quick listing.
+        forecast_blob = serializable_results or {}
 
         insert_data = {
             'scenario_id': scenario_id,
@@ -2061,6 +2057,43 @@ def _maybe_json(value, default):
         except Exception:
             return default
     return default
+
+
+def _snapshot_to_forecast_results(snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Normalize snapshot row -> forecast_results dict.
+    Supports:
+    - legacy string-encoded JSON blobs
+    - legacy "forecast_data" that only contains timeline/revenue/costs/profit
+    - new snapshots where forecast_data is the full forecast results dict
+    """
+    try:
+        forecast_data = _maybe_json(snapshot.get("forecast_data"), {})
+        summary = _maybe_json(snapshot.get("summary_stats"), {})
+        mc = _maybe_json(snapshot.get("monte_carlo_data"), None)
+        valuation = _maybe_json(snapshot.get("valuation_data"), None)
+
+        # New snapshots: forecast_data is already full results payload
+        if isinstance(forecast_data, dict) and ("revenue" in forecast_data or "timeline" in forecast_data):
+            out = dict(forecast_data)
+            if "success" not in out:
+                out["success"] = True
+            if "summary" not in out:
+                out["summary"] = summary or {}
+            return out
+
+        # Fallback: old minimal blob
+        out = {
+            "success": True,
+            "timeline": (forecast_data or {}).get("timeline", []),
+            "revenue": (forecast_data or {}).get("revenue", {}),
+            "costs": (forecast_data or {}).get("costs", {}),
+            "profit": (forecast_data or {}).get("profit", {}),
+            "summary": summary or {},
+        }
+        return out
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -4981,15 +5014,7 @@ Your data may only be in session memory and will be lost when you close the brow
         if snapshots:
             snapshot = snapshots[0]
             try:
-                forecast_data = _maybe_json(snapshot.get('forecast_data'), {})
-                results = {
-                    'success': True,
-                    'timeline': forecast_data.get('timeline', []),
-                    'revenue': forecast_data.get('revenue', {}),
-                    'costs': forecast_data.get('costs', {}),
-                    'profit': forecast_data.get('profit', {}),
-                    'summary': _maybe_json(snapshot.get('summary_stats'), {})
-                }
+                results = _snapshot_to_forecast_results(snapshot)
                 alert_box(f"Showing saved snapshot: {snapshot.get('snapshot_name', 'Latest')}", "info")
             except:
                 pass
@@ -6732,15 +6757,7 @@ def render_snapshots_tab(db, scenario_id: str, user_id: str):
             with col1:
                 if st.button("📥 Load", key=f"load_snap_{snapshot['id']}_{idx}"):
                     try:
-                        forecast_data = _maybe_json(snapshot.get('forecast_data'), {})
-                        st.session_state['forecast_results'] = {
-                            'success': True,
-                            'timeline': forecast_data.get('timeline', []),
-                            'revenue': forecast_data.get('revenue', {}),
-                            'costs': forecast_data.get('costs', {}),
-                            'profit': forecast_data.get('profit', {}),
-                            'summary': _maybe_json(snapshot.get('summary_stats'), {})
-                        }
+                        st.session_state['forecast_results'] = _snapshot_to_forecast_results(snapshot)
                         st.success("Snapshot loaded!")
                         st.rerun()
                     except Exception as e:

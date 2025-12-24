@@ -2180,21 +2180,13 @@ def render_whatif_section():
         if not baseline_forecast:
             try:
                 from components.forecast_section import load_snapshots
-                import json
                 
                 snapshots = load_snapshots(db, scenario_id, limit=1)
                 if snapshots:
                     snapshot = snapshots[0]
                     try:
-                        forecast_data = json.loads(snapshot.get('forecast_data', '{}'))
-                        baseline_forecast = {
-                            'success': True,
-                            'timeline': forecast_data.get('timeline', []),
-                            'revenue': forecast_data.get('revenue', {}),
-                            'costs': forecast_data.get('costs', {}),
-                            'profit': forecast_data.get('profit', {}),
-                            'summary': json.loads(snapshot.get('summary_stats', '{}'))
-                        }
+                        from components.forecast_section import _snapshot_to_forecast_results
+                        baseline_forecast = _snapshot_to_forecast_results(snapshot)
                     except Exception as e:
                         baseline_forecast = None
             except Exception:

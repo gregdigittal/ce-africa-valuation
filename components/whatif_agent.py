@@ -318,6 +318,16 @@ def render_manual_adjustments_tab(baseline_forecast: Dict[str, Any]):
     # Show results automatically (no button needed for real-time)
     if adjusted_forecast:
         display_whatif_results(baseline_forecast, adjusted_forecast, adjustments)
+        # Optional: show DCF valuation delta (if available)
+        try:
+            from api.valuation import run_dcf_valuation
+            base_assumptions = baseline_forecast.get("assumptions", {}) or {}
+            base_val, base_ev = run_dcf_valuation(baseline_forecast, base_assumptions, net_debt=0.0)
+            adj_val, adj_ev = run_dcf_valuation(adjusted_forecast, base_assumptions, net_debt=0.0)
+            st.markdown("#### 💰 Valuation (DCF)")
+            st.metric("Enterprise Value (Adjusted)", f"R {adj_ev:,.0f}", delta=f"R {adj_ev - base_ev:,.0f}")
+        except Exception:
+            pass
     
     # Scenario Comparison
     st.markdown("---")
