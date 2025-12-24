@@ -2482,6 +2482,7 @@ def render_import_with_mapping(
         # ---------------------------------------------------------------------
         # Preflight diagnostics (data quality before writing to DB)
         # ---------------------------------------------------------------------
+        preflight_block = False
         if isinstance(mapped_df, pd.DataFrame) and not mapped_df.empty:
             with st.expander("🧪 Preflight Validation (Recommended)", expanded=False):
                 try:
@@ -2500,16 +2501,18 @@ def render_import_with_mapping(
                     diag_rows.append({"check": "target table", "value": str(config.get("table"))})
 
                     # Date parsing
+                    bad_period_date = 0
                     if "period_date" in mapped_df.columns:
                         _dt = pd.to_datetime(mapped_df["period_date"], errors="coerce")
-                        bad_dates = int(_dt.isna().sum())
-                        diag_rows.append({"check": "invalid period_date", "value": bad_dates})
+                        bad_period_date = int(_dt.isna().sum())
+                        diag_rows.append({"check": "invalid period_date", "value": bad_period_date})
                     if "month" in mapped_df.columns:
                         _dt = pd.to_datetime(mapped_df["month"], errors="coerce")
                         bad_dates = int(_dt.isna().sum())
                         diag_rows.append({"check": "invalid month", "value": bad_dates})
 
                     # Amount parsing
+                    bad_amt = 0
                     if "amount" in mapped_df.columns:
                         # Use the same parsing tolerance as the importer (commas, currency symbols, etc.)
                         _parsed_amt = mapped_df["amount"].apply(lambda v: parse_number(v, default=float("nan")))
@@ -2574,6 +2577,38 @@ def render_import_with_mapping(
 
                     st.dataframe(pd.DataFrame(diag_rows), hide_index=True, use_container_width=True)
 
+                    # Period coverage: expected (selection) vs actual (file)
+                    if import_settings and import_settings.get("selected_periods") and "period_date" in mapped_df.columns:
+                        try:
+                            expected_periods = set(str(x) for x in (import_settings.get("selected_periods") or []))
+                            actual_periods = set(
+                                pd.to_datetime(mapped_df["period_date"], errors="coerce")
+                                .dt.to_period("M")
+                                .astype(str)
+                                .dropna()
+                                .tolist()
+                            )
+                            missing = sorted(expected_periods - actual_periods)
+                            extra = sorted(actual_periods - expected_periods)
+
+                            st.caption("Period coverage (expected vs detected in mapped data):")
+                            st.write(f"- Expected periods: **{len(expected_periods)}**")
+                            st.write(f"- Detected periods: **{len(actual_periods)}**")
+                            if missing:
+                                st.warning(
+                                    "Missing selected periods in the mapped file: "
+                                    + ", ".join(missing[:12])
+                                    + (" ..." if len(missing) > 12 else "")
+                                )
+                            if extra:
+                                st.info(
+                                    "Mapped file includes additional periods not selected: "
+                                    + ", ".join(extra[:12])
+                                    + (" ..." if len(extra) > 12 else "")
+                                )
+                        except Exception:
+                            pass
+
                     # IS-specific: coverage sanity for Revenue / COGS by month
                     if (
                         import_type == "historical_income_statement_line_items"
@@ -2587,18 +2622,24 @@ def render_import_with_mapping(
 
                         is_revenue = dfp["category_norm"].str.contains("revenue|sales|income|turnover", na=False)
                         is_cogs = dfp["category_norm"].str.contains("cost of sales|cogs|cost of goods|purchases", na=False)
+                        is_opex = dfp["category_norm"].str.contains(
+                            "opex|operating expense|operating expenses|expense|expenses|overhead|admin|administration|distribution|selling|marketing",
+                            na=False
+                        )
 
                         by_month = (
                             dfp.groupby("period_date")
                             .apply(lambda g: pd.Series({
                                 "revenue_sum": float(g.loc[is_revenue.reindex(g.index, fill_value=False), "amount"].sum()),
                                 "cogs_sum": float(g.loc[is_cogs.reindex(g.index, fill_value=False), "amount"].sum()),
+                                "opex_sum": float(g.loc[is_opex.reindex(g.index, fill_value=False), "amount"].sum()),
                             }))
                             .reset_index()
                             .sort_values("period_date")
                         )
                         by_month["has_revenue"] = by_month["revenue_sum"] != 0
                         by_month["has_cogs"] = by_month["cogs_sum"] != 0
+                        by_month["has_opex"] = by_month["opex_sum"] != 0
 
                         zero_rev = by_month.loc[~by_month["has_revenue"], "period_date"]
                         if len(zero_rev) > 0:
@@ -2607,6 +2648,13 @@ def render_import_with_mapping(
                                 + ", ".join(pd.to_datetime(zero_rev).dt.strftime("%Y-%m").head(12).tolist())
                                 + (" ..." if len(zero_rev) > 12 else "")
                             )
+                        zero_cogs = by_month.loc[~by_month["has_cogs"], "period_date"]
+                        if len(zero_cogs) > 0:
+                            st.warning(
+                                "COGS appears to be zero for some selected periods: "
+                                + ", ".join(pd.to_datetime(zero_cogs).dt.strftime("%Y-%m").head(12).tolist())
+                                + (" ..." if len(zero_cogs) > 12 else "")
+                            )
 
                         st.caption("Income statement monthly coverage (post-mapping):")
                         st.dataframe(
@@ -2614,6 +2662,25 @@ def render_import_with_mapping(
                             hide_index=True,
                             use_container_width=True,
                         )
+
+                    # Optional: block import on critical issues
+                    enforce_clean = st.checkbox(
+                        "Block import if critical issues are detected",
+                        value=False,
+                        help="If enabled, disables the import button when invalid dates/amounts are present (recommended for large imports).",
+                        key=f"{import_type}_preflight_block_toggle",
+                    )
+                    if enforce_clean:
+                        critical = []
+                        if bad_period_date > 0:
+                            critical.append(f"{bad_period_date} invalid period_date values")
+                        if bad_amt > 0:
+                            critical.append(f"{bad_amt} unparseable amount values")
+                        if expected_stmt and statement_guess and statement_guess != expected_stmt:
+                            critical.append("statement type mismatch")
+                        if critical:
+                            preflight_block = True
+                            st.error("Import blocked due to: " + ", ".join(critical))
                 except Exception as _diag_err:
                     st.warning(f"Preflight validation failed: {str(_diag_err)[:160]}")
         
@@ -2624,7 +2691,9 @@ def render_import_with_mapping(
                 f"🚀 Import {config['display_name']}",
                 type="primary",
                 key=f"import_{import_type}_btn",
-                disabled=not is_valid or (import_settings is not None and not import_settings.get("selected_periods"))
+                disabled=(not is_valid)
+                or preflight_block
+                or (import_settings is not None and not import_settings.get("selected_periods"))
             )
         
         if import_btn and is_valid:
