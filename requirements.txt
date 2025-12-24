@@ -16,6 +16,9 @@ uvicorn>=0.40.0
 redis>=7.1.0
 rq>=2.6.0
 
+# API auth (Supabase JWT verification)
+python-jose[cryptography]>=3.5.0
+
 # Data Processing & Analysis
 scipy>=1.11.0
 scikit-learn>=1.3.0

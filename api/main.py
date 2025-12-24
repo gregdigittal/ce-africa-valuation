@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 
+from api.auth import parse_bearer_token, verify_supabase_jwt
 from api.jobs import fetch_job, job_to_status
 from api.models import ForecastRunRequest, JobStatusResponse, SnapshotGetResponse, SnapshotListItem
 from api.queue import get_queue
@@ -43,17 +44,47 @@ def get_job_status(job_id: str):
 @app.get("/v1/scenarios/{scenario_id}/snapshots", response_model=list[SnapshotListItem])
 def list_snapshots(
     scenario_id: str,
-    user_id: str = Query(..., description="User UUID"),
+    request: Request,
+    user_id: str | None = Query(None, description="User UUID (fallback when no Authorization header)"),
     limit: int = Query(50, ge=1, le=200),
 ):
+    effective_user_id = user_id
+    try:
+        token = parse_bearer_token(request.headers.get("Authorization"))
+        if token:
+            effective_user_id = verify_supabase_jwt(token).user_id
+    except Exception:
+        # If JWT is present but invalid, reject
+        if request.headers.get("Authorization"):
+            raise HTTPException(status_code=401, detail="Invalid Authorization token")
+
+    if not effective_user_id:
+        raise HTTPException(status_code=401, detail="Missing user_id (provide Authorization header or user_id query param)")
+
     db = SupabaseAPIHandler()
-    return db.list_snapshots(scenario_id=scenario_id, user_id=user_id, limit=limit)
+    return db.list_snapshots(scenario_id=scenario_id, user_id=effective_user_id, limit=limit)
 
 
 @app.get("/v1/snapshots/{snapshot_id}", response_model=SnapshotGetResponse)
-def get_snapshot(snapshot_id: str, user_id: str = Query(..., description="User UUID")):
+def get_snapshot(
+    snapshot_id: str,
+    request: Request,
+    user_id: str | None = Query(None, description="User UUID (fallback when no Authorization header)"),
+):
+    effective_user_id = user_id
+    try:
+        token = parse_bearer_token(request.headers.get("Authorization"))
+        if token:
+            effective_user_id = verify_supabase_jwt(token).user_id
+    except Exception:
+        if request.headers.get("Authorization"):
+            raise HTTPException(status_code=401, detail="Invalid Authorization token")
+
+    if not effective_user_id:
+        raise HTTPException(status_code=401, detail="Missing user_id (provide Authorization header or user_id query param)")
+
     db = SupabaseAPIHandler()
-    snap = db.get_snapshot(snapshot_id=snapshot_id, user_id=user_id)
+    snap = db.get_snapshot(snapshot_id=snapshot_id, user_id=effective_user_id)
     if not snap:
         raise HTTPException(status_code=404, detail="Snapshot not found")
     return snap
