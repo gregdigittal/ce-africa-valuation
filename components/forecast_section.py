@@ -4577,6 +4577,12 @@ Best when you have reliable historical financials and want trend-driven forecast
                             "forecast_duration_months": int(st.session_state.get("forecast_periods", 60)),
                             "forecast_method": st.session_state.get("forecast_method", None),
                             "use_trend_forecast": bool(st.session_state.get("use_trend_forecast", False)),
+                            "run_monte_carlo": bool(include_monte_carlo),
+                            "mc_iterations": int(mc_iterations),
+                            "mc_fleet_cv": float(mc_fleet_cv),
+                            "mc_prospect_cv": float(mc_prospect_cv),
+                            "mc_cost_cv": float(mc_cost_cv),
+                            "mc_seed": 42,
                         },
                     }
                     resp = _http_json("POST", run_url, payload=payload, timeout=30)
@@ -4623,13 +4629,15 @@ Best when you have reliable historical financials and want trend-driven forecast
                                 try:
                                     snap = (
                                         db.client.table("forecast_snapshots")
-                                        .select("forecast_data")
+                                        .select("forecast_data, monte_carlo_data")
                                         .eq("id", snapshot_id)
                                         .limit(1)
                                         .execute()
                                     )
                                     if snap.data and snap.data[0].get("forecast_data"):
                                         st.session_state["forecast_results"] = snap.data[0]["forecast_data"]
+                                        if snap.data[0].get("monte_carlo_data"):
+                                            st.session_state["mc_results"] = snap.data[0]["monte_carlo_data"]
                                         st.success("Loaded snapshot into UI.")
                                         st.rerun()
                                     else:

@@ -74,6 +74,7 @@ class SupabaseAPIHandler:
         snapshot_type: str,
         assumptions_data: Dict[str, Any],
         forecast_data: Dict[str, Any],
+        monte_carlo_data: Optional[Dict[str, Any]] = None,
         snapshot_date: Optional[date] = None,
     ) -> Optional[str]:
         """
@@ -93,6 +94,8 @@ class SupabaseAPIHandler:
                 "assumptions_data": assumptions_data,
                 "forecast_data": forecast_data,
             }
+            if monte_carlo_data is not None:
+                payload["monte_carlo_data"] = monte_carlo_data
             if snapshot_date is not None:
                 payload["snapshot_date"] = snapshot_date.isoformat()
 

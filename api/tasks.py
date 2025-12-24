@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from api.forecast_data import load_forecast_data_api
+from api.monte_carlo import run_monte_carlo_simple
 from api.supabase_handler import SupabaseAPIHandler
 from api.serialize import to_jsonable
 from forecast_engine import ForecastEngine
@@ -71,12 +72,26 @@ def run_forecast_task(
     engine = ForecastEngine()
     results = engine.run_forecast(data, manufacturing_scenario=None, progress_callback=None)
 
+    # Optional Monte Carlo (API mode)
+    mc_results: Optional[Dict[str, Any]] = None
+    if bool(options.get("run_monte_carlo")):
+        mc_results = run_monte_carlo_simple(
+            results,
+            iterations=int(options.get("mc_iterations", 1000)),
+            fleet_cv=float(options.get("mc_fleet_cv", 0.10)),
+            prospect_cv=float(options.get("mc_prospect_cv", 0.30)),
+            cost_cv=float(options.get("mc_cost_cv", 0.10)),
+            seed=int(options.get("mc_seed", 42)),
+            progress_callback=None,
+        )
+
     # Persist as snapshot (preferred transport for big payloads)
     snapshot_name = str(options.get("snapshot_name") or f"API Forecast {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     snapshot_type = str(options.get("snapshot_type") or "base")
 
     assumptions_data = to_jsonable(data.get("assumptions") or {})
     forecast_data = to_jsonable(results)
+    monte_carlo_data = to_jsonable(mc_results) if mc_results is not None else None
 
     snapshot_id = db.insert_forecast_snapshot(
         scenario_id=scenario_id,
@@ -85,6 +100,7 @@ def run_forecast_task(
         snapshot_type=snapshot_type,
         assumptions_data=assumptions_data if isinstance(assumptions_data, dict) else {"value": assumptions_data},
         forecast_data=forecast_data if isinstance(forecast_data, dict) else {"value": forecast_data},
+        monte_carlo_data=monte_carlo_data if isinstance(monte_carlo_data, dict) else ({"value": monte_carlo_data} if monte_carlo_data is not None else None),
     )
 
     return {
@@ -94,6 +110,15 @@ def run_forecast_task(
         "started_at": started,
         "finished_at": datetime.now(tz=timezone.utc).isoformat(),
         "result": _compact_results(results),
+        "mc": (
+            {
+                "success": mc_results.get("success"),
+                "iterations": mc_results.get("iterations"),
+                "error": mc_results.get("error"),
+            }
+            if isinstance(mc_results, dict)
+            else None
+        ),
         "snapshot_id": snapshot_id,
     }
 
