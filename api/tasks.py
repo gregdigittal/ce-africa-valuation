@@ -71,7 +71,16 @@ def run_forecast_task(
     data = load_forecast_data_api(db, scenario_id=scenario_id, user_id=user_id, options=options)
 
     engine = ForecastEngine()
-    results = engine.run_forecast(data, manufacturing_scenario=None, progress_callback=None)
+    manufacturing_scenario = None
+    if bool(options.get("include_manufacturing")) and isinstance(options.get("manufacturing_strategy"), dict):
+        try:
+            from components.vertical_integration import IntegrationScenario
+
+            manufacturing_scenario = IntegrationScenario.from_dict(options.get("manufacturing_strategy") or {})
+        except Exception:
+            manufacturing_scenario = None
+
+    results = engine.run_forecast(data, manufacturing_scenario=manufacturing_scenario, progress_callback=None)
 
     # Optional Monte Carlo (API mode)
     mc_results: Optional[Dict[str, Any]] = None

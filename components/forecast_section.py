@@ -4585,11 +4585,11 @@ Best when you have reliable historical financials and want trend-driven forecast
             help="Example: http://localhost:8000",
             key="forecast_api_base_url",
         ).rstrip("/") + "/"
-        st.caption("API job runner currently executes the forecast engine only (no in-app progress bar).")
+        st.caption("API job runner executes forecasts in the background (no in-app progress bar).")
         if include_monte_carlo:
             st.info("Monte Carlo is not wired to API mode yet (Local mode only).")
         if include_manufacturing:
-            st.info("Manufacturing scenario is not wired to API mode yet (Local mode only).")
+            st.info("Manufacturing scenario will be passed to the API job (requires it to be configured).")
     
     # Run buttons
     if exec_mode == "Local (in-app)":
@@ -4662,8 +4662,16 @@ Best when you have reliable historical financials and want trend-driven forecast
                             "mc_prospect_cv": float(mc_prospect_cv),
                             "mc_cost_cv": float(mc_cost_cv),
                             "mc_seed": 42,
+                            "include_manufacturing": bool(include_manufacturing),
                         },
                     }
+                    if include_manufacturing:
+                        try:
+                            vi_scenario = st.session_state.get("vi_scenario")
+                            if vi_scenario and hasattr(vi_scenario, "to_dict"):
+                                payload["options"]["manufacturing_strategy"] = vi_scenario.to_dict()
+                        except Exception:
+                            pass
                     resp = _http_json("POST", run_url, payload=payload, timeout=30)
                     job_id = resp.get("job_id")
                     if not job_id:
