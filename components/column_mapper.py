@@ -1573,6 +1573,54 @@ def process_import(
             # Default: insert (fastest). If duplicates occur, fallback is handled outside.
             db.client.table(table).insert(payload).execute()
 
+    def _is_transient_supabase_error(err: Exception) -> bool:
+        """
+        Heuristic detection for transient PostgREST/Supabase gateway/network errors.
+        These should be safe to retry (e.g., 502 network connection lost).
+        """
+        msg = str(err).lower()
+        # Common transient indicators observed in Supabase/PostgREST
+        transient_markers = [
+            "gateway error",
+            "bad gateway",
+            "service unavailable",
+            "network connection lost",
+            "connection lost",
+            "connection reset",
+            "econnreset",
+            "broken pipe",
+            "server disconnected",
+            "timeout",
+            "timed out",
+            "504",
+            "503",
+            "502",
+            "429",
+        ]
+        if "json could not be generated" in msg:
+            # Only treat as transient when it's paired with a gateway/network signal
+            return ("gateway" in msg) or ("network" in msg) or ("502" in msg) or ("503" in msg) or ("504" in msg)
+        return any(s in msg for s in transient_markers)
+
+    def _exec_with_retries(fn, attempts: int = 3, base_sleep_s: float = 0.6) -> None:
+        """Execute a DB call with small exponential backoff on transient errors."""
+        import time
+
+        last_err: Optional[Exception] = None
+        for attempt in range(1, max(int(attempts), 1) + 1):
+            try:
+                fn()
+                return
+            except Exception as e:
+                last_err = e
+                if _is_transient_supabase_error(e) and attempt < attempts:
+                    # Exponential backoff: 0.6s, 1.2s, 2.4s ...
+                    time.sleep(base_sleep_s * (2 ** (attempt - 1)))
+                    continue
+                raise
+        if last_err:
+            raise last_err
+
     def _write_chunk_with_backoff(records_chunk: List[Tuple[int, Dict[str, Any]]]) -> None:
         """
         Write a chunk, splitting automatically on request-size/time issues.
@@ -1581,13 +1629,20 @@ def process_import(
         We keep default chunk_size=1000 but automatically split a failing chunk to isolate/fit limits.
         """
         try:
-            _write_chunk(records_chunk)
+            _exec_with_retries(lambda: _write_chunk(records_chunk), attempts=3)
             return
         except Exception as e:
             msg = str(e).lower()
             # Heuristics for payload-size / request issues
             maybe_too_large = any(s in msg for s in ["413", "payload", "request entity too large", "too large", "timeout"])
+            transient = _is_transient_supabase_error(e)
             if maybe_too_large and len(records_chunk) > 1:
+                mid = len(records_chunk) // 2
+                _write_chunk_with_backoff(records_chunk[:mid])
+                _write_chunk_with_backoff(records_chunk[mid:])
+                return
+            # If it's a transient gateway/network issue, retry with smaller batches as a last resort.
+            if transient and len(records_chunk) > 1:
                 mid = len(records_chunk) // 2
                 _write_chunk_with_backoff(records_chunk[:mid])
                 _write_chunk_with_backoff(records_chunk[mid:])
@@ -1623,13 +1678,22 @@ def process_import(
             for row_num, record in chunk:
                 try:
                     if on_conflict:
-                        db.client.table(table).upsert(record, on_conflict=on_conflict).execute()
+                        _exec_with_retries(
+                            lambda: db.client.table(table).upsert(record, on_conflict=on_conflict).execute(),
+                            attempts=3
+                        )
                     else:
                         try:
-                            db.client.table(table).insert(record).execute()
+                            _exec_with_retries(
+                                lambda: db.client.table(table).insert(record).execute(),
+                                attempts=3
+                            )
                         except Exception as insert_err:
                             if 'duplicate' in str(insert_err).lower() or '23505' in str(insert_err):
-                                db.client.table(table).upsert(record).execute()
+                                _exec_with_retries(
+                                    lambda: db.client.table(table).upsert(record).execute(),
+                                    attempts=3
+                                )
                             else:
                                 raise
                     stats['success'] += 1
