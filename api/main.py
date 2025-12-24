@@ -41,9 +41,13 @@ def get_job_status(job_id: str):
 
 
 @app.get("/v1/scenarios/{scenario_id}/snapshots", response_model=list[SnapshotListItem])
-def list_snapshots(scenario_id: str, user_id: str = Query(..., description="User UUID")):
+def list_snapshots(
+    scenario_id: str,
+    user_id: str = Query(..., description="User UUID"),
+    limit: int = Query(50, ge=1, le=200),
+):
     db = SupabaseAPIHandler()
-    return db.list_snapshots(scenario_id=scenario_id, user_id=user_id, limit=50)
+    return db.list_snapshots(scenario_id=scenario_id, user_id=user_id, limit=limit)
 
 
 @app.get("/v1/snapshots/{snapshot_id}", response_model=SnapshotGetResponse)

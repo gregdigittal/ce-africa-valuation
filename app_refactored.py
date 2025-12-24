@@ -1999,7 +1999,7 @@ def render_funding_section_view():
             try:
                 from components.forecast_section import load_snapshots
                 import json
-                snapshots = load_snapshots(db, scenario_id, limit=1)
+                snapshots = load_snapshots(db, scenario_id, limit=1, user_id=user_id)
                 if snapshots and len(snapshots) > 0:
                     latest_snapshot = snapshots[0]
                     # Convert snapshot data to forecast_results format
@@ -2181,7 +2181,7 @@ def render_whatif_section():
             try:
                 from components.forecast_section import load_snapshots
                 
-                snapshots = load_snapshots(db, scenario_id, limit=1)
+                snapshots = load_snapshots(db, scenario_id, limit=1, user_id=user_id)
                 if snapshots:
                     snapshot = snapshots[0]
                     try:

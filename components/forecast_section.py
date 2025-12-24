@@ -63,6 +63,10 @@ from dateutil.relativedelta import relativedelta
 from typing import Dict, List, Any, Optional, Tuple
 import traceback
 from dataclasses import dataclass, field
+import os
+import urllib.request
+import urllib.error
+from urllib.parse import urljoin
 
 
 # =============================================================================
@@ -1234,9 +1238,24 @@ def load_forecast_data(db, scenario_id: str, user_id: str = None, force_refresh:
 
 
 
-def load_snapshots(db, scenario_id: str, limit: int = 10) -> List[Dict]:
+def load_snapshots(db, scenario_id: str, limit: int = 10, user_id: Optional[str] = None) -> List[Dict]:
     """Load saved forecast snapshots."""
     try:
+        # Prefer API snapshot list if configured and user_id available (thin-client mode)
+        api_base = (os.getenv("FORECAST_API_URL") or "").strip().rstrip("/")
+        effective_user_id = user_id or st.session_state.get("user_id")
+        if api_base and effective_user_id:
+            try:
+                url = urljoin(api_base + "/", f"v1/scenarios/{scenario_id}/snapshots?user_id={effective_user_id}&limit={int(limit)}")
+                req = urllib.request.Request(url, headers={"Content-Type": "application/json"}, method="GET")
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    raw = resp.read().decode("utf-8")
+                    data = json.loads(raw) if raw else []
+                    if isinstance(data, list) and data:
+                        return data
+            except Exception:
+                pass
+
         result = db.client.table(TABLE_FORECAST_SNAPSHOTS).select('*').eq(
             'scenario_id', scenario_id
         ).order('created_at', desc=True).limit(limit).execute()
@@ -6785,7 +6804,7 @@ def render_snapshots_tab(db, scenario_id: str, user_id: str):
     """Render the snapshots management tab."""
     section_header("Forecast Snapshots", "Save and compare forecast versions")
     
-    snapshots = load_snapshots(db, scenario_id, limit=20)
+    snapshots = load_snapshots(db, scenario_id, limit=20, user_id=user_id)
     
     if not snapshots:
         empty_state(
@@ -6817,7 +6836,29 @@ def render_snapshots_tab(db, scenario_id: str, user_id: str):
             with col1:
                 if st.button("📥 Load", key=f"load_snap_{snapshot['id']}_{idx}"):
                     try:
-                        st.session_state['forecast_results'] = _snapshot_to_forecast_results(snapshot)
+                        # Prefer API snapshot endpoint if configured
+                        api_base = (os.getenv("FORECAST_API_URL") or "").strip().rstrip("/")
+                        if api_base:
+                            try:
+                                url = urljoin(api_base + "/", f"v1/snapshots/{snapshot['id']}?user_id={user_id}")
+                                req = urllib.request.Request(url, headers={"Content-Type": "application/json"}, method="GET")
+                                with urllib.request.urlopen(req, timeout=15) as resp:
+                                    raw = resp.read().decode("utf-8")
+                                    snap_row = json.loads(raw) if raw else {}
+                                if isinstance(snap_row, dict) and snap_row.get("forecast_data"):
+                                    st.session_state["forecast_results"] = snap_row.get("forecast_data")
+                                    if snap_row.get("monte_carlo_data"):
+                                        st.session_state["mc_results"] = snap_row.get("monte_carlo_data")
+                                    if snap_row.get("valuation_data"):
+                                        st.session_state["valuation_data"] = snap_row.get("valuation_data")
+                                    if snap_row.get("enterprise_value") is not None:
+                                        st.session_state["enterprise_value"] = snap_row.get("enterprise_value")
+                                else:
+                                    st.session_state['forecast_results'] = _snapshot_to_forecast_results(snapshot)
+                            except Exception:
+                                st.session_state['forecast_results'] = _snapshot_to_forecast_results(snapshot)
+                        else:
+                            st.session_state['forecast_results'] = _snapshot_to_forecast_results(snapshot)
                         st.success("Snapshot loaded!")
                         st.rerun()
                     except Exception as e:
