@@ -4471,55 +4471,157 @@ Best when you have reliable historical financials and want trend-driven forecast
     
     st.markdown("---")
     
-    # Run button
-    if st.button("▶️ Run Full Forecast", type="primary", use_container_width=True, key="run_forecast_main_btn"):
-        progress_bar = st.progress(0, text="Starting forecast...")
-        status = st.empty()
-        
-        def update_progress(pct, msg):
-            progress_bar.progress(pct, text=msg)
-            status.caption(msg)
-        
-        # Get manufacturing scenario if enabled
-        mfg_scenario = None
+    # =========================================================================
+    # EXECUTION MODE (Local vs API Worker)
+    # =========================================================================
+    import os
+    import urllib.request
+    import urllib.error
+    from urllib.parse import urljoin
+    
+    def _http_json(method: str, url: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 30) -> Dict[str, Any]:
+        headers = {"Content-Type": "application/json"}
+        data = None
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    
+    exec_mode = st.radio(
+        "Execution mode",
+        ["Local (in-app)", "API (background)"],
+        horizontal=True,
+        key="forecast_exec_mode",
+        help="Use API mode to avoid UI hangs for long runs (requires Redis + API worker running).",
+    )
+    
+    api_base_url_default = os.getenv("FORECAST_API_URL", "http://localhost:8000").rstrip("/") + "/"
+    api_base_url = api_base_url_default
+    if exec_mode == "API (background)":
+        api_base_url = st.text_input(
+            "API base URL",
+            value=api_base_url_default.rstrip("/"),
+            help="Example: http://localhost:8000",
+            key="forecast_api_base_url",
+        ).rstrip("/") + "/"
+        st.caption("API job runner currently executes the forecast engine only (no in-app progress bar).")
+        if include_monte_carlo:
+            st.info("Monte Carlo is not wired to API mode yet (Local mode only).")
         if include_manufacturing:
-            mfg_scenario = st.session_state.get('vi_scenario')
-        
-        # Run forecast
-        results = run_forecast(db, scenario_id, user_id, progress_callback=update_progress, 
-                              manufacturing_scenario=mfg_scenario)
-        
-        if not results['success']:
-            st.error(f"Forecast failed: {results.get('error', 'Unknown error')}")
+            st.info("Manufacturing scenario is not wired to API mode yet (Local mode only).")
+    
+    # Run buttons
+    if exec_mode == "Local (in-app)":
+        if st.button("▶️ Run Full Forecast", type="primary", use_container_width=True, key="run_forecast_main_btn"):
+            progress_bar = st.progress(0, text="Starting forecast...")
+            status = st.empty()
+            
+            def update_progress(pct, msg):
+                progress_bar.progress(pct, text=msg)
+                status.caption(msg)
+            
+            # Get manufacturing scenario if enabled
+            mfg_scenario = None
+            if include_manufacturing:
+                mfg_scenario = st.session_state.get('vi_scenario')
+            
+            # Run forecast
+            results = run_forecast(db, scenario_id, user_id, progress_callback=update_progress, 
+                                  manufacturing_scenario=mfg_scenario)
+            
+            if not results['success']:
+                st.error(f"Forecast failed: {results.get('error', 'Unknown error')}")
+                progress_bar.empty()
+                status.empty()
+                return
+            
+            # Store manufacturing flag in results for snapshot comparison
+            results['manufacturing_included'] = include_manufacturing
+            results['manufacturing_strategy'] = mfg_scenario.strategy if mfg_scenario else None
+            
+            # Store in session state
+            st.session_state['forecast_results'] = results
+            
+            # Run Monte Carlo if enabled
+            if include_monte_carlo:
+                status.caption("Running Monte Carlo simulation...")
+                mc_config = {
+                    'iterations': mc_iterations,
+                    'fleet_cv': mc_fleet_cv,
+                    'prospect_cv': mc_prospect_cv,
+                    'cost_cv': mc_cost_cv,
+                    'seed': 42
+                }
+                mc_results = run_monte_carlo(results, mc_config, progress_callback=update_progress)
+                st.session_state['mc_results'] = mc_results
+            
             progress_bar.empty()
             status.empty()
-            return
+            
+            # Force rerun to display results properly
+            st.rerun()
+    else:
+        job_key = f"forecast_api_job_id_{scenario_id}"
         
-        # Store manufacturing flag in results for snapshot comparison
-        results['manufacturing_included'] = include_manufacturing
-        results['manufacturing_strategy'] = mfg_scenario.strategy if mfg_scenario else None
+        cols = st.columns([2, 1, 1])
+        with cols[0]:
+            if st.button("▶️ Run Forecast via API (Background)", type="primary", use_container_width=True, key="run_forecast_api_btn"):
+                try:
+                    run_url = urljoin(api_base_url, "v1/forecasts/run")
+                    payload = {
+                        "scenario_id": scenario_id,
+                        "user_id": user_id,
+                        "options": {
+                            "forecast_duration_months": int(st.session_state.get("forecast_periods", 60)),
+                            "forecast_method": st.session_state.get("forecast_method", None),
+                            "use_trend_forecast": bool(st.session_state.get("use_trend_forecast", False)),
+                        },
+                    }
+                    resp = _http_json("POST", run_url, payload=payload, timeout=30)
+                    job_id = resp.get("job_id")
+                    if not job_id:
+                        st.error(f"API did not return job_id. Response: {resp}")
+                    else:
+                        st.session_state[job_key] = job_id
+                        st.success(f"Enqueued job: {job_id}")
+                except urllib.error.HTTPError as e:
+                    try:
+                        body = e.read().decode("utf-8")
+                    except Exception:
+                        body = ""
+                    st.error(f"API error ({e.code}): {body or e}")
+                except Exception as e:
+                    st.error(f"Failed to enqueue job: {e}")
         
-        # Store in session state
-        st.session_state['forecast_results'] = results
+        with cols[1]:
+            st.button("Refresh status", use_container_width=True, key="refresh_forecast_api_job")
         
-        # Run Monte Carlo if enabled
-        if include_monte_carlo:
-            status.caption("Running Monte Carlo simulation...")
-            mc_config = {
-                'iterations': mc_iterations,
-                'fleet_cv': mc_fleet_cv,
-                'prospect_cv': mc_prospect_cv,
-                'cost_cv': mc_cost_cv,
-                'seed': 42
-            }
-            mc_results = run_monte_carlo(results, mc_config, progress_callback=update_progress)
-            st.session_state['mc_results'] = mc_results
+        with cols[2]:
+            if st.button("Clear job", use_container_width=True, key="clear_forecast_api_job"):
+                if job_key in st.session_state:
+                    del st.session_state[job_key]
         
-        progress_bar.empty()
-        status.empty()
-        
-        # Force rerun to display results properly
-        st.rerun()
+        job_id = st.session_state.get(job_key)
+        if job_id:
+            try:
+                status_url = urljoin(api_base_url, f"v1/jobs/{job_id}")
+                status_resp = _http_json("GET", status_url, payload=None, timeout=30)
+                st.markdown("#### API job status")
+                st.json(status_resp)
+                
+                if status_resp.get("status") == "finished":
+                    job_result = status_resp.get("result") or {}
+                    compact = job_result.get("result") if isinstance(job_result, dict) else None
+                    if compact and isinstance(compact, dict) and compact.get("success"):
+                        st.success("✅ API forecast finished successfully (preview payload).")
+                    elif compact and isinstance(compact, dict) and not compact.get("success", True):
+                        st.error(f"API forecast failed: {compact.get('error')}")
+                elif status_resp.get("status") == "failed":
+                    st.error("❌ API job failed. See error in payload above.")
+            except Exception as e:
+                st.error(f"Failed to fetch job status: {e}")
     
     # =========================================================================
     # RESULTS & SAVE SECTION - OUTSIDE THE RUN BUTTON BLOCK (FIXED!)
