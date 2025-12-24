@@ -1913,12 +1913,21 @@ def convert_to_serializable(obj):
     elif isinstance(obj, (np.int64, np.int32, np.int16, np.int8, np.int_)):
         return int(obj)
     elif isinstance(obj, (np.float64, np.float32, np.float16)):
-        return float(obj)
+        val = float(obj)
+        return val if np.isfinite(val) else None
     # Handle numpy scalar float types (for NumPy 2.0+ compatibility, np.float_ removed)
     elif isinstance(obj, np.floating):
-        return float(obj)
+        val = float(obj)
+        return val if np.isfinite(val) else None
+    elif isinstance(obj, float):
+        return obj if np.isfinite(obj) else None
     elif isinstance(obj, np.bool_):
         return bool(obj)
+    elif isinstance(obj, (pd.Timestamp, datetime, date)):
+        try:
+            return obj.isoformat()
+        except Exception:
+            return str(obj)
     elif isinstance(obj, dict):
         return {k: convert_to_serializable(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -1955,19 +1964,24 @@ def save_snapshot(
         serializable_mc = convert_to_serializable(mc_results) if mc_results else None
         
         # Build the insert data
+        # IMPORTANT:
+        # - forecast_snapshots columns are JSONB in Supabase; store dicts, not json.dumps() strings.
+        # - This keeps API-mode and Streamlit-mode snapshots consistent.
+        forecast_blob = {
+            'timeline': serializable_results.get('timeline', []),
+            'revenue': serializable_results.get('revenue', {}),
+            'costs': serializable_results.get('costs', {}),
+            'profit': serializable_results.get('profit', {})
+        }
+
         insert_data = {
             'scenario_id': scenario_id,
             'user_id': user_id,
             'snapshot_name': snapshot_name,
             'snapshot_type': snapshot_type,
             'snapshot_date': datetime.now().date().isoformat(),
-            'forecast_data': json.dumps({
-                'timeline': serializable_results.get('timeline', []),
-                'revenue': serializable_results.get('revenue', {}),
-                'costs': serializable_results.get('costs', {}),
-                'profit': serializable_results.get('profit', {})
-            }),
-            'summary_stats': json.dumps(serializable_results.get('summary', {})),
+            'forecast_data': forecast_blob,
+            'summary_stats': serializable_results.get('summary', {}) or {},
             'total_revenue_forecast': float(serializable_results.get('summary', {}).get('total_revenue', 0) or 0),
             'total_gross_profit_forecast': float(serializable_results.get('summary', {}).get('total_gross_profit', 0) or 0),
             'enterprise_value': 0.0,
@@ -1977,10 +1991,10 @@ def save_snapshot(
         
         # Add optional fields
         if serializable_results.get('assumptions'):
-            insert_data['assumptions_data'] = json.dumps(serializable_results['assumptions'])
+            insert_data['assumptions_data'] = serializable_results['assumptions']
         
         if serializable_mc:
-            insert_data['monte_carlo_data'] = json.dumps(serializable_mc)
+            insert_data['monte_carlo_data'] = serializable_mc
         
         # Insert into database
         result = db.client.table(TABLE_FORECAST_SNAPSHOTS).insert(insert_data).execute()
@@ -2029,6 +2043,24 @@ def delete_snapshot(db, snapshot_id: str, user_id: str) -> bool:
     except Exception as e:
         st.error(f"Error deleting snapshot: {e}")
         return False
+
+
+def _maybe_json(value, default):
+    """
+    Snapshots historically stored some JSONB fields as JSON strings.
+    This helper supports both legacy (string) and correct (dict) shapes.
+    """
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else default
+        except Exception:
+            return default
+    return default
 
 
 # =============================================================================
@@ -4949,14 +4981,14 @@ Your data may only be in session memory and will be lost when you close the brow
         if snapshots:
             snapshot = snapshots[0]
             try:
-                forecast_data = json.loads(snapshot.get('forecast_data', '{}'))
+                forecast_data = _maybe_json(snapshot.get('forecast_data'), {})
                 results = {
                     'success': True,
                     'timeline': forecast_data.get('timeline', []),
                     'revenue': forecast_data.get('revenue', {}),
                     'costs': forecast_data.get('costs', {}),
                     'profit': forecast_data.get('profit', {}),
-                    'summary': json.loads(snapshot.get('summary_stats', '{}'))
+                    'summary': _maybe_json(snapshot.get('summary_stats'), {})
                 }
                 alert_box(f"Showing saved snapshot: {snapshot.get('snapshot_name', 'Latest')}", "info")
             except:
@@ -6700,14 +6732,14 @@ def render_snapshots_tab(db, scenario_id: str, user_id: str):
             with col1:
                 if st.button("📥 Load", key=f"load_snap_{snapshot['id']}_{idx}"):
                     try:
-                        forecast_data = json.loads(snapshot.get('forecast_data', '{}'))
+                        forecast_data = _maybe_json(snapshot.get('forecast_data'), {})
                         st.session_state['forecast_results'] = {
                             'success': True,
                             'timeline': forecast_data.get('timeline', []),
                             'revenue': forecast_data.get('revenue', {}),
                             'costs': forecast_data.get('costs', {}),
                             'profit': forecast_data.get('profit', {}),
-                            'summary': json.loads(snapshot.get('summary_stats', '{}'))
+                            'summary': _maybe_json(snapshot.get('summary_stats'), {})
                         }
                         st.success("Snapshot loaded!")
                         st.rerun()
