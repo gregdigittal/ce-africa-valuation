@@ -2473,10 +2473,149 @@ def render_import_with_mapping(
                 st.warning(f"⚠️ {err}")
         
         # Mapped preview
+        mapped_df = None
         if mapping:
+            mapped_df = apply_mapping(raw_df, mapping)
             with st.expander("👁️ Preview Mapped Data", expanded=True):
-                mapped_df = apply_mapping(raw_df, mapping)
                 st.dataframe(mapped_df.head(10), use_container_width=True)
+
+        # ---------------------------------------------------------------------
+        # Preflight diagnostics (data quality before writing to DB)
+        # ---------------------------------------------------------------------
+        if isinstance(mapped_df, pd.DataFrame) and not mapped_df.empty:
+            with st.expander("🧪 Preflight Validation (Recommended)", expanded=False):
+                try:
+                    diag_rows = []
+                    statement_guess = None
+                    expected_stmt = {
+                        "historical_income_statement_line_items": "income_statement",
+                        "historical_balance_sheet_line_items": "balance_sheet",
+                        "historical_cashflow_line_items": "cash_flow",
+                    }.get(import_type)
+
+                    # Basic shape
+                    diag_rows.append({"check": "rows", "value": int(len(mapped_df))})
+                    diag_rows.append({"check": "columns", "value": int(len(mapped_df.columns))})
+                    diag_rows.append({"check": "target import_type", "value": str(import_type)})
+                    diag_rows.append({"check": "target table", "value": str(config.get("table"))})
+
+                    # Date parsing
+                    if "period_date" in mapped_df.columns:
+                        _dt = pd.to_datetime(mapped_df["period_date"], errors="coerce")
+                        bad_dates = int(_dt.isna().sum())
+                        diag_rows.append({"check": "invalid period_date", "value": bad_dates})
+                    if "month" in mapped_df.columns:
+                        _dt = pd.to_datetime(mapped_df["month"], errors="coerce")
+                        bad_dates = int(_dt.isna().sum())
+                        diag_rows.append({"check": "invalid month", "value": bad_dates})
+
+                    # Amount parsing
+                    if "amount" in mapped_df.columns:
+                        # Use the same parsing tolerance as the importer (commas, currency symbols, etc.)
+                        _parsed_amt = mapped_df["amount"].apply(lambda v: parse_number(v, default=float("nan")))
+                        bad_amt = int(pd.isna(_parsed_amt).sum())
+                        diag_rows.append({"check": "unparseable amount", "value": bad_amt})
+                    
+                    # Statement type guess (best-effort) to catch "wrong tab / wrong statement" uploads
+                    if "category" in mapped_df.columns:
+                        _cat = mapped_df["category"].astype(str).str.lower()
+                        _scores = {
+                            "cash_flow": int(_cat.str.contains(r"operating activities|investing activities|financing activities", na=False).sum()),
+                            "balance_sheet": int(_cat.str.contains(r"asset|liabil|equity|current asset|non[- ]current asset|current liabil|non[- ]current liabil", na=False).sum()),
+                            "income_statement": int(_cat.str.contains(r"revenue|sales|income|turnover|cogs|cost of sales|operating expense|opex|gross profit", na=False).sum()),
+                        }
+                        _best = max(_scores, key=_scores.get) if _scores else None
+                        if _best and _scores.get(_best, 0) > 0:
+                            statement_guess = _best
+                            diag_rows.append({"check": "statement type guess", "value": statement_guess})
+                        else:
+                            diag_rows.append({"check": "statement type guess", "value": "unknown"})
+                    
+                    if expected_stmt and statement_guess and statement_guess != expected_stmt:
+                        st.warning(
+                            f"⚠️ This upload looks like **{statement_guess.replace('_', ' ').title()}**, "
+                            f"but you're importing into **{expected_stmt.replace('_', ' ').title()}** "
+                            f"({import_type}).\n\n"
+                            f"Tip: switch to the correct statement tab before importing."
+                        )
+
+                    # Required fields empty check
+                    # NOTE: In this repo, config["fields"] is a dict:
+                    #   { field_name: {label, required, type, ...}, ... }
+                    # Some other codebases use a list-of-dicts; handle both safely.
+                    required_fields = []
+                    _fields_cfg = config.get("fields") or {}
+                    if isinstance(_fields_cfg, dict):
+                        for _fname, _meta in _fields_cfg.items():
+                            if isinstance(_meta, dict) and _meta.get("required"):
+                                required_fields.append(str(_fname))
+                    elif isinstance(_fields_cfg, list):
+                        for _f in _fields_cfg:
+                            if isinstance(_f, dict) and _f.get("required"):
+                                # Support either {"field": "..."} or {"name": "..."} shapes
+                                _name = _f.get("field") or _f.get("name")
+                                if _name:
+                                    required_fields.append(str(_name))
+                    for rf in required_fields:
+                        if rf in mapped_df.columns:
+                            empties = int(mapped_df[rf].isna().sum() + (mapped_df[rf].astype(str).str.strip() == "").sum())
+                            diag_rows.append({"check": f"empty required: {rf}", "value": empties})
+
+                    # Duplicate key detection for line-item imports (best-effort)
+                    if import_type in [
+                        "historical_income_statement_line_items",
+                        "historical_balance_sheet_line_items",
+                        "historical_cashflow_line_items",
+                    ]:
+                        key_cols = [c for c in ["scenario_id", "period_date", "line_item_name", "statement_type"] if c in mapped_df.columns]
+                        if len(key_cols) >= 3:
+                            dupes = int(mapped_df.duplicated(subset=key_cols, keep=False).sum())
+                            diag_rows.append({"check": f"duplicate rows by {','.join(key_cols)}", "value": dupes})
+
+                    st.dataframe(pd.DataFrame(diag_rows), hide_index=True, use_container_width=True)
+
+                    # IS-specific: coverage sanity for Revenue / COGS by month
+                    if (
+                        import_type == "historical_income_statement_line_items"
+                        and (statement_guess in (None, "income_statement"))
+                        and {"period_date", "category", "amount"}.issubset(mapped_df.columns)
+                    ):
+                        dfp = mapped_df.copy()
+                        dfp["period_date"] = pd.to_datetime(dfp["period_date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+                        dfp["amount"] = dfp["amount"].apply(lambda v: parse_number(v, default=0.0))
+                        dfp["category_norm"] = dfp["category"].astype(str).str.lower()
+
+                        is_revenue = dfp["category_norm"].str.contains("revenue|sales|income|turnover", na=False)
+                        is_cogs = dfp["category_norm"].str.contains("cost of sales|cogs|cost of goods|purchases", na=False)
+
+                        by_month = (
+                            dfp.groupby("period_date")
+                            .apply(lambda g: pd.Series({
+                                "revenue_sum": float(g.loc[is_revenue.reindex(g.index, fill_value=False), "amount"].sum()),
+                                "cogs_sum": float(g.loc[is_cogs.reindex(g.index, fill_value=False), "amount"].sum()),
+                            }))
+                            .reset_index()
+                            .sort_values("period_date")
+                        )
+                        by_month["has_revenue"] = by_month["revenue_sum"] != 0
+                        by_month["has_cogs"] = by_month["cogs_sum"] != 0
+
+                        zero_rev = by_month.loc[~by_month["has_revenue"], "period_date"]
+                        if len(zero_rev) > 0:
+                            st.warning(
+                                "Revenue appears to be zero for some selected periods: "
+                                + ", ".join(pd.to_datetime(zero_rev).dt.strftime("%Y-%m").head(12).tolist())
+                                + (" ..." if len(zero_rev) > 12 else "")
+                            )
+
+                        st.caption("Income statement monthly coverage (post-mapping):")
+                        st.dataframe(
+                            by_month.assign(period_date=by_month["period_date"].dt.strftime("%Y-%m")),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+                except Exception as _diag_err:
+                    st.warning(f"Preflight validation failed: {str(_diag_err)[:160]}")
         
         # Import button
         col1, col2 = st.columns([1, 3])
@@ -2489,7 +2628,7 @@ def render_import_with_mapping(
             )
         
         if import_btn and is_valid:
-            mapped_df = apply_mapping(raw_df, mapping)
+            mapped_df = mapped_df if isinstance(mapped_df, pd.DataFrame) else apply_mapping(raw_df, mapping)
 
             # Persist import settings (period selection + YTD config) into assumptions for this scenario
             try:
