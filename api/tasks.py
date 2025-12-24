@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 from api.forecast_data import load_forecast_data_api
 from api.supabase_handler import SupabaseAPIHandler
+from api.serialize import to_jsonable
 from forecast_engine import ForecastEngine
 
 
@@ -70,6 +71,22 @@ def run_forecast_task(
     engine = ForecastEngine()
     results = engine.run_forecast(data, manufacturing_scenario=None, progress_callback=None)
 
+    # Persist as snapshot (preferred transport for big payloads)
+    snapshot_name = str(options.get("snapshot_name") or f"API Forecast {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    snapshot_type = str(options.get("snapshot_type") or "base")
+
+    assumptions_data = to_jsonable(data.get("assumptions") or {})
+    forecast_data = to_jsonable(results)
+
+    snapshot_id = db.insert_forecast_snapshot(
+        scenario_id=scenario_id,
+        user_id=user_id,
+        snapshot_name=snapshot_name,
+        snapshot_type=snapshot_type,
+        assumptions_data=assumptions_data if isinstance(assumptions_data, dict) else {"value": assumptions_data},
+        forecast_data=forecast_data if isinstance(forecast_data, dict) else {"value": forecast_data},
+    )
+
     return {
         "scenario_id": scenario_id,
         "user_id": user_id,
@@ -77,5 +94,6 @@ def run_forecast_task(
         "started_at": started,
         "finished_at": datetime.now(tz=timezone.utc).isoformat(),
         "result": _compact_results(results),
+        "snapshot_id": snapshot_id,
     }
 

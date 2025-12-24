@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Dict, Optional
 
 from supabase import Client, create_client
@@ -54,4 +55,52 @@ class SupabaseAPIHandler:
             return {}
         except Exception:
             return {}
+
+    def get_scenario_user_id(self, scenario_id: str) -> Optional[str]:
+        try:
+            resp = self.client.table("scenarios").select("user_id").eq("id", scenario_id).limit(1).execute()
+            if resp.data and resp.data[0].get("user_id"):
+                return str(resp.data[0]["user_id"])
+            return None
+        except Exception:
+            return None
+
+    def insert_forecast_snapshot(
+        self,
+        *,
+        scenario_id: str,
+        user_id: Optional[str],
+        snapshot_name: str,
+        snapshot_type: str,
+        assumptions_data: Dict[str, Any],
+        forecast_data: Dict[str, Any],
+        snapshot_date: Optional[date] = None,
+    ) -> Optional[str]:
+        """
+        Insert a minimal snapshot record and return its ID.
+        """
+        try:
+            effective_user_id = user_id or self.get_scenario_user_id(scenario_id)
+            if not effective_user_id:
+                # Can't write to forecast_snapshots without user_id (NOT NULL)
+                return None
+
+            payload: Dict[str, Any] = {
+                "user_id": effective_user_id,
+                "scenario_id": scenario_id,
+                "snapshot_name": snapshot_name,
+                "snapshot_type": snapshot_type,
+                "assumptions_data": assumptions_data,
+                "forecast_data": forecast_data,
+            }
+            if snapshot_date is not None:
+                payload["snapshot_date"] = snapshot_date.isoformat()
+
+            # Return inserted row id
+            resp = self.client.table("forecast_snapshots").insert(payload).execute()
+            if resp.data and resp.data[0].get("id"):
+                return str(resp.data[0]["id"])
+            return None
+        except Exception:
+            return None
 

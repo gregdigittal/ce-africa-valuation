@@ -4616,6 +4616,26 @@ Best when you have reliable historical financials and want trend-driven forecast
                     compact = job_result.get("result") if isinstance(job_result, dict) else None
                     if compact and isinstance(compact, dict) and compact.get("success"):
                         st.success("✅ API forecast finished successfully (preview payload).")
+                        snapshot_id = job_result.get("snapshot_id") if isinstance(job_result, dict) else None
+                        if snapshot_id:
+                            st.caption(f"Snapshot saved: {snapshot_id}")
+                            if st.button("Load snapshot into UI", use_container_width=True, key=f"load_api_snapshot_{snapshot_id}"):
+                                try:
+                                    snap = (
+                                        db.client.table("forecast_snapshots")
+                                        .select("forecast_data")
+                                        .eq("id", snapshot_id)
+                                        .limit(1)
+                                        .execute()
+                                    )
+                                    if snap.data and snap.data[0].get("forecast_data"):
+                                        st.session_state["forecast_results"] = snap.data[0]["forecast_data"]
+                                        st.success("Loaded snapshot into UI.")
+                                        st.rerun()
+                                    else:
+                                        st.error("Snapshot found but forecast_data was empty.")
+                                except Exception as e:
+                                    st.error(f"Failed to load snapshot: {e}")
                     elif compact and isinstance(compact, dict) and not compact.get("success", True):
                         st.error(f"API forecast failed: {compact.get('error')}")
                 elif status_resp.get("status") == "failed":
