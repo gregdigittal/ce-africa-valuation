@@ -12,7 +12,25 @@ import pandas as pd
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Callable
 from copy import deepcopy
-import streamlit as st
+from typing import Any as _Any
+
+# Streamlit is optional: this module must also run outside Streamlit (API/worker/tests).
+try:  # pragma: no cover
+    import streamlit as st  # type: ignore
+except Exception:  # pragma: no cover
+    st = None  # type: ignore
+
+
+def _ui(method: str, *args: _Any, **kwargs: _Any) -> None:
+    """Best-effort UI logging. No-ops when not running under Streamlit."""
+    if st is None:
+        return
+    try:
+        fn = getattr(st, method, None)
+        if callable(fn):
+            fn(*args, **kwargs)
+    except Exception:
+        return
 
 
 class ForecastEngine:
@@ -125,14 +143,10 @@ class ForecastEngine:
         trend_forecast_config = assumptions.get('trend_forecasts', {})  # Legacy support
         
         # Log which method is being used
-        try:
-            import streamlit as st
-            if forecast_method == 'trend':
-                st.info(f"📊 Using **Trend-Based** forecast method")
-            else:
-                st.info(f"📈 Using **Pipeline-Based** forecast method (Fleet + Prospects)")
-        except:
-            pass
+        if forecast_method == 'trend':
+            _ui("info", "📊 Using **Trend-Based** forecast method")
+        else:
+            _ui("info", "📈 Using **Pipeline-Based** forecast method (Fleet + Prospects)")
         
         # ==========================================================================
         # NEW: Line-Item Level Forecasting (Phase 2)
@@ -174,12 +188,7 @@ class ForecastEngine:
                 if line_item_result is not None:
                     # Convert to legacy format and merge
                     legacy_results = convert_to_legacy_format(line_item_result, start_date)
-                    
-                    try:
-                        import streamlit as st
-                        st.success(f"✅ Line-item forecast complete: {len(line_item_result.line_items)} items forecasted")
-                    except:
-                        pass
+                    _ui("success", f"✅ Line-item forecast complete: {len(line_item_result.line_items)} items forecasted")
                     
                     # Update results with line-item forecast
                     results.update(legacy_results)
@@ -191,24 +200,12 @@ class ForecastEngine:
                     
                     return results
                 else:
-                    try:
-                        import streamlit as st
-                        st.warning("⚠️ Line-item forecast returned no results. Falling back to legacy trend method.")
-                    except:
-                        pass
+                    _ui("warning", "⚠️ Line-item forecast returned no results. Falling back to legacy trend method.")
             except ImportError as e:
-                try:
-                    import streamlit as st
-                    st.warning(f"⚠️ Line-item engine not available: {e}. Using legacy method.")
-                except:
-                    pass
+                _ui("warning", f"⚠️ Line-item engine not available: {e}. Using legacy method.")
             except Exception as e:
-                try:
-                    import streamlit as st
-                    st.error(f"❌ Line-item forecast error: {e}")
-                    st.info("Falling back to legacy trend method.")
-                except:
-                    pass
+                _ui("error", f"❌ Line-item forecast error: {e}")
+                _ui("info", "Falling back to legacy trend method.")
         
         # Use comprehensive forecast configs if available (only if trend method selected)
         if use_trend_forecast and forecast_configs and len(forecast_configs) > 0:
@@ -278,13 +275,11 @@ class ForecastEngine:
                     error_details.append(f"**Available configs:** {list(forecast_configs.keys())}")
                 
                 error_msg = "\n".join(error_details)
-                
-                try:
-                    import streamlit as st
-                    st.error("❌ **TREND FORECAST FAILED**")
-                    st.markdown(error_msg)
-                    st.markdown("---")
-                    st.warning("""
+
+                _ui("error", "❌ **TREND FORECAST FAILED**")
+                _ui("markdown", error_msg)
+                _ui("markdown", "---")
+                _ui("warning", """
 **How to Fix:**
 1. Go to **AI Assumptions → Trend Forecast** tab
 2. Select the revenue element and configure a valid trend
@@ -292,9 +287,7 @@ class ForecastEngine:
 4. Return here and run the forecast again
 
 The forecast cannot continue without valid trend parameters when trend-based forecasting is enabled.
-                    """)
-                except:
-                    pass
+                """)
                 
                 # Return error result instead of falling back
                 results['success'] = False
@@ -351,36 +344,28 @@ The forecast cannot continue without valid trend parameters when trend-based for
                         pipeline_rev = np.zeros(n_months)
                 else:
                     # ERROR: Legacy trend forecast failed
-                    try:
-                        import streamlit as st
-                        st.error("❌ **LEGACY TREND FORECAST FAILED**")
-                        st.markdown(f"**Element:** revenue")
-                        st.markdown(f"**Trend Config:** {trend_config}")
-                        st.markdown(f"**Historical Data Length:** {len(historical_revenue)}")
-                        st.warning("""
+                    _ui("error", "❌ **LEGACY TREND FORECAST FAILED**")
+                    _ui("markdown", "**Element:** revenue")
+                    _ui("markdown", f"**Trend Config:** {trend_config}")
+                    _ui("markdown", f"**Historical Data Length:** {len(historical_revenue)}")
+                    _ui("warning", """
 **How to Fix:**
 Please configure the trend forecast properly in AI Assumptions → Trend Forecast tab.
-                        """)
-                    except:
-                        pass
+                    """)
                     
                     results['success'] = False
                     results['error'] = "Legacy trend forecast failed for revenue - insufficient historical data or invalid parameters"
                     return results
             else:
                 # ERROR: No historical data for trend-based forecast
-                try:
-                    import streamlit as st
-                    st.error("❌ **NO HISTORICAL DATA FOR TREND FORECAST**")
-                    st.markdown("Trend-based forecasting is enabled but no historical revenue data is available.")
-                    st.warning("""
+                _ui("error", "❌ **NO HISTORICAL DATA FOR TREND FORECAST**")
+                _ui("markdown", "Trend-based forecasting is enabled but no historical revenue data is available.")
+                _ui("warning", """
 **How to Fix:**
 1. Go to **Setup** and import historical financial data
 2. Ensure the 'revenue' column is mapped correctly
 3. Return here and run the forecast again
-                    """)
-                except:
-                    pass
+                """)
                     
                 results['success'] = False
                 results['error'] = "No historical revenue data available for trend-based forecast"
@@ -416,11 +401,7 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
                     forecast_configs, data, start_date, cogs_config_key, total_rev
                 )
             except Exception as e:
-                try:
-                    import streamlit as st
-                    st.error(f"❌ COGS trend failed: {e}")
-                except:
-                    pass
+                _ui("error", f"❌ COGS trend failed: {e}")
                 results['success'] = False
                 results['error'] = f"COGS trend forecast failed: {e}"
                 return results
@@ -448,11 +429,7 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
                     forecast_configs, data, start_date, opex_config_key
                 )
             except Exception as e:
-                try:
-                    import streamlit as st
-                    st.error(f"❌ OPEX trend failed: {e}")
-                except:
-                    pass
+                _ui("error", f"❌ OPEX trend failed: {e}")
                 results['success'] = False
                 results['error'] = f"OPEX trend forecast failed: {e}"
                 return results
@@ -689,11 +666,7 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
         
         if config is None:
             # Debug: Log why config wasn't found
-            try:
-                import streamlit as st
-                st.warning(f"⚠️ No config found for '{element_name}'. Available configs: {list(forecast_configs.keys())}")
-            except:
-                pass
+            _ui("warning", f"⚠️ No config found for '{element_name}'. Available configs: {list(forecast_configs.keys())}")
             return None
         
         method = config.get('method', 'trend_fit')
@@ -709,11 +682,7 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
             # Get historical data
             historical_data = data.get('historic_financials', pd.DataFrame())
             if historical_data.empty:
-                try:
-                    import streamlit as st
-                    st.error(f"❌ No historical data found for {element_name}. Available data keys: {list(data.keys())}")
-                except:
-                    pass
+                _ui("error", f"❌ No historical data found for {element_name}. Available data keys: {list(data.keys())}")
                 return None
             
             # Map element names to possible column names in historical data
@@ -753,7 +722,7 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
                 # Try to provide helpful error message
                 try:
                     available_cols = list(historical_data.columns)
-                    st.warning(f"⚠️ Could not find column for {element_name} in historical data. Available columns: {available_cols}")
+                    _ui("warning", f"⚠️ Could not find column for {element_name} in historical data. Available columns: {available_cols}")
                 except:
                     pass
                 return None
@@ -768,10 +737,7 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
             
             data_series = data_series.dropna()
             if len(data_series) < 3:
-                try:
-                    st.warning(f"⚠️ Insufficient historical data for {element_name}: {len(data_series)} periods (need at least 3)")
-                except:
-                    pass
+                _ui("warning", f"⚠️ Insufficient historical data for {element_name}: {len(data_series)} periods (need at least 3)")
                 return None
             
             if method == 'trend_fit':
@@ -785,10 +751,7 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
                 except ValueError:
                     # Invalid function type, try linear as fallback
                     function_type = TrendFunction.LINEAR
-                    try:
-                        st.warning(f"Invalid trend function type '{function_type_str}' for {element_name}, using linear")
-                    except:
-                        pass
+                    _ui("warning", f"Invalid trend function type '{function_type_str}' for {element_name}, using linear")
                 
                 trend_params = config.get('trend_parameters', {})
                 
@@ -796,11 +759,7 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
                 
                 # Validate trend parameters are not empty
                 if not trend_params:
-                    try:
-                        import streamlit as st
-                        st.warning(f"⚠️ No trend parameters found for {element_name}. Using default parameters calculated from historical data.")
-                    except:
-                        pass
+                    _ui("warning", f"⚠️ No trend parameters found for {element_name}. Using default parameters calculated from historical data.")
                     # Use default parameters based on function type
                     if function_type == TrendFunction.LINEAR:
                         # Default linear: use last value as intercept, calculate slope from data
@@ -815,11 +774,7 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
                     else:
                         trend_params = {}
                     
-                    try:
-                        import streamlit as st
-                        st.info(f"📊 Calculated default parameters for {element_name}: {trend_params}")
-                    except:
-                        pass
+                    _ui("info", f"📊 Calculated default parameters for {element_name}: {trend_params}")
                 
                 try:
                     forecast = analyzer.generate_forecast_with_params(
@@ -833,13 +788,12 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
                 except Exception as forecast_error:
                     # More specific error handling for forecast generation
                     try:
-                        import streamlit as st
                         import traceback
-                        st.error(f"❌ Failed to generate {function_type_str} forecast for {element_name}")
-                        st.error(f"Error: {str(forecast_error)}")
-                        st.info(f"Parameters used: {trend_params}")
-                        st.info(f"Historical data: {len(data_series)} periods, range=[{data_series.min():,.0f}, {data_series.max():,.0f}]")
-                        st.code(traceback.format_exc())
+                        _ui("error", f"❌ Failed to generate {function_type_str} forecast for {element_name}")
+                        _ui("error", f"Error: {str(forecast_error)}")
+                        _ui("info", f"Parameters used: {trend_params}")
+                        _ui("info", f"Historical data: {len(data_series)} periods, range=[{data_series.min():,.0f}, {data_series.max():,.0f}]")
+                        _ui("code", traceback.format_exc())
                     except:
                         pass
                     raise  # Re-raise to be caught by outer exception handler
@@ -929,8 +883,8 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
             try:
                 import traceback
                 error_details = traceback.format_exc()
-                st.error(f"❌ {error_msg}\n\n**Details:**\n```\n{error_details}\n```")
-                st.warning(f"⚠️ Falling back to default calculation for {element_name}. Please check your trend configuration.")
+                _ui("error", f"❌ {error_msg}\n\n**Details:**\n```\n{error_details}\n```")
+                _ui("warning", f"⚠️ Falling back to default calculation for {element_name}. Please check your trend configuration.")
             except:
                 # If st is not available, log to console
                 import traceback
@@ -1079,12 +1033,8 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
         else:
             # Trend failed for COGS - raise to stop forecast (no silent fallback)
             error_msg = f"COGS trend forecast failed (method={method}, element={cogs_config_key})"
-            try:
-                import streamlit as st
-                st.error(f"❌ {error_msg}")
-                st.caption("Please fix the COGS trend configuration in AI Assumptions → Trend Forecast.")
-            except:
-                pass
+            _ui("error", f"❌ {error_msg}")
+            _ui("caption", "Please fix the COGS trend configuration in AI Assumptions → Trend Forecast.")
             raise RuntimeError(error_msg)
     
     def _calculate_opex(
@@ -1168,12 +1118,8 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
         else:
             # Trend failed for OPEX - raise to stop forecast (no silent fallback)
             error_msg = f"OPEX trend forecast failed (method={method}, element={opex_config_key})"
-            try:
-                import streamlit as st
-                st.error(f"❌ {error_msg}")
-                st.caption("Please fix the OPEX trend configuration in AI Assumptions → Trend Forecast.")
-            except:
-                pass
+            _ui("error", f"❌ {error_msg}")
+            _ui("caption", "Please fix the OPEX trend configuration in AI Assumptions → Trend Forecast.")
             raise RuntimeError(error_msg)
     
     def _store_results(

@@ -7,7 +7,49 @@ Analyzes historical financial data and provides trend-based forecasting with:
 3. Integration into forecast engine
 """
 
-import streamlit as st
+from typing import Any as _Any
+
+# Streamlit is optional: trend functions may run in API/worker context.
+try:  # pragma: no cover
+    import streamlit as st  # type: ignore
+except Exception:  # pragma: no cover
+    st = None  # type: ignore
+
+
+def _ui(method: str, *args: _Any, **kwargs: _Any) -> None:
+    if st is None:
+        return
+    try:
+        fn = getattr(st, method, None)
+        if callable(fn):
+            fn(*args, **kwargs)
+    except Exception:
+        return
+
+
+class _SafeStProxy:
+    """Wrap Streamlit calls so they never crash non-Streamlit runtimes."""
+
+    def __init__(self, st_module: _Any):
+        self._st = st_module
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._st, name, None)
+        if not callable(attr):
+            return attr
+
+        def _wrapped(*args: _Any, **kwargs: _Any):
+            try:
+                return attr(*args, **kwargs)
+            except Exception:
+                return None
+
+        return _wrapped
+
+
+if st is not None:  # pragma: no cover
+    st = _SafeStProxy(st)  # type: ignore
+
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go

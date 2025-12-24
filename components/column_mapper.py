@@ -1531,7 +1531,10 @@ def process_import(
     ]
     on_conflict: Optional[str] = None
     if table in line_item_tables:
-        on_conflict = 'scenario_id,period_date,line_item_name'
+        # These tables are keyed by a 4-column UNIQUE constraint:
+        #   UNIQUE(scenario_id, period_date, line_item_name, statement_type)
+        # Postgres requires the ON CONFLICT column list to exactly match a UNIQUE/EXCLUSION constraint.
+        on_conflict = 'scenario_id,period_date,line_item_name,statement_type'
     elif table == 'expense_assumptions':
         on_conflict = 'scenario_id,expense_code'
     else:
