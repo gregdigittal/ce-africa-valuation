@@ -1682,6 +1682,10 @@ def process_import(
         #   UNIQUE(scenario_id, period_date, line_item_name, statement_type)
         # Postgres requires the ON CONFLICT column list to exactly match a UNIQUE/EXCLUSION constraint.
         on_conflict = 'scenario_id,period_date,line_item_name,statement_type'
+    elif table == 'sales_orders':
+        # Natural key (see migration add_sales_orders_unique_key):
+        #   UNIQUE(scenario_id, user_id, order_number, order_date, item_code, description)
+        on_conflict = 'scenario_id,user_id,order_number,order_date,item_code,description'
     elif table == 'expense_assumptions':
         on_conflict = 'scenario_id,expense_code'
     else:
