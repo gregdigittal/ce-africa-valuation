@@ -1091,7 +1091,7 @@ def _get_monthly_sales_pattern(db, scenario_id: str) -> Optional[np.ndarray]:
             except Exception:
                 pass
 
-        # Try 1: Look for monthly sales data in dedicated table
+        # Try 1: Look for monthly sales data in dedicated table (scenario-scoped)
         if hasattr(db, 'client'):
             try:
                 response = db.client.table('sales_orders').select(
@@ -1102,14 +1102,15 @@ def _get_monthly_sales_pattern(db, scenario_id: str) -> Optional[np.ndarray]:
                     df = pd.DataFrame(response.data)
                     df['order_date'] = pd.to_datetime(df['order_date'], errors='coerce')
                     df['month'] = df['order_date'].dt.month
+                    df['total_amount'] = pd.to_numeric(df.get('total_amount'), errors='coerce').fillna(0.0)
                     
                     # Aggregate by month
                     monthly = df.groupby('month')['total_amount'].sum()
                     
-                    if len(monthly) >= 6:  # Need at least 6 months of data
+                    if int((monthly > 0).sum()) >= 6:  # Need at least 6 active months
                         pattern = np.zeros(12)
                         for m in range(1, 13):
-                            pattern[m - 1] = monthly.get(m, 0)
+                            pattern[m - 1] = float(monthly.get(m, 0.0))
                         
                         if pattern.sum() > 0:
                             return pattern / pattern.sum()

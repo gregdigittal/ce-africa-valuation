@@ -109,25 +109,53 @@ def _get_monthly_sales_pattern_api(db, scenario_id: str) -> Optional[np.ndarray]
             .execute()
         )
         rows = resp.data or []
-        if len(rows) < 12:
-            return None
-        sdf = pd.DataFrame(rows)
-        sdf["date"] = pd.to_datetime(sdf["date"], errors="coerce")
-        sdf = sdf.dropna(subset=["date"])
-        if sdf.empty:
-            return None
-        sdf["month"] = sdf["date"].dt.month
-        sdf["quantity"] = pd.to_numeric(sdf.get("quantity"), errors="coerce").fillna(0.0)
-        sdf["unit_price_sold"] = pd.to_numeric(sdf.get("unit_price_sold"), errors="coerce").fillna(0.0)
-        sdf["sales"] = sdf["quantity"] * sdf["unit_price_sold"]
-        monthly = sdf.groupby("month")["sales"].sum()
-        if int((monthly > 0).sum()) < 6:
-            return None
-        pattern = np.zeros(12, dtype=float)
-        for m in range(1, 13):
-            pattern[m - 1] = float(monthly.get(m, 0.0))
-        s = float(pattern.sum())
-        return (pattern / s) if s > 0 else None
+        if len(rows) >= 12:
+            sdf = pd.DataFrame(rows)
+            sdf["date"] = pd.to_datetime(sdf["date"], errors="coerce")
+            sdf = sdf.dropna(subset=["date"])
+            if not sdf.empty:
+                sdf["month"] = sdf["date"].dt.month
+                sdf["quantity"] = pd.to_numeric(sdf.get("quantity"), errors="coerce").fillna(0.0)
+                sdf["unit_price_sold"] = pd.to_numeric(sdf.get("unit_price_sold"), errors="coerce").fillna(0.0)
+                sdf["sales"] = sdf["quantity"] * sdf["unit_price_sold"]
+                monthly = sdf.groupby("month")["sales"].sum()
+                if int((monthly > 0).sum()) >= 6:
+                    pattern = np.zeros(12, dtype=float)
+                    for m in range(1, 13):
+                        pattern[m - 1] = float(monthly.get(m, 0.0))
+                    s = float(pattern.sum())
+                    if s > 0:
+                        return pattern / s
+
+        # Fallback: scenario-scoped sales orders (requires sales_orders table)
+        try:
+            so = (
+                db.client.table("sales_orders")
+                .select("order_date,total_amount")
+                .eq("scenario_id", scenario_id)
+                .eq("user_id", scen_user_id)
+                .execute()
+            )
+            so_rows = so.data or []
+            if len(so_rows) >= 12:
+                odf = pd.DataFrame(so_rows)
+                odf["order_date"] = pd.to_datetime(odf["order_date"], errors="coerce")
+                odf = odf.dropna(subset=["order_date"])
+                if not odf.empty:
+                    odf["month"] = odf["order_date"].dt.month
+                    odf["total_amount"] = pd.to_numeric(odf.get("total_amount"), errors="coerce").fillna(0.0)
+                    monthly2 = odf.groupby("month")["total_amount"].sum()
+                    if int((monthly2 > 0).sum()) >= 6:
+                        pattern = np.zeros(12, dtype=float)
+                        for m in range(1, 13):
+                            pattern[m - 1] = float(monthly2.get(m, 0.0))
+                        s = float(pattern.sum())
+                        if s > 0:
+                            return pattern / s
+        except Exception:
+            pass
+
+        return None
     except Exception:
         return None
 
