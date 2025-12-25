@@ -87,7 +87,7 @@ def load_table_data(
             "expense_assumptions",
         ]
 
-        user_and_scenario_tables = ["installed_base", "creditors", "prospects"]
+        user_and_scenario_tables = ["installed_base", "creditors", "prospects", "sales_orders"]
 
         if table in user_only_tables:
             query = query.eq("user_id", user_id)
@@ -124,7 +124,7 @@ def clear_table_data(db, table: str, user_id: str, scenario_id: str = None) -> b
             "historical_cashflow_line_items",
         ]
 
-        user_and_scenario_tables = ["installed_base", "creditors", "prospects"]
+        user_and_scenario_tables = ["installed_base", "creditors", "prospects", "sales_orders"]
 
         if table in user_only_tables:
             query = query.eq("user_id", user_id)
@@ -325,11 +325,25 @@ def render_step_basics(db, scenario_id: str, user_id: str):
             try:
                 existing = db.client.table("assumptions").select("id").eq("scenario_id", scenario_id).execute()
                 if existing.data:
-                    db.client.table("assumptions").update({"data": assumptions_data}).eq("scenario_id", scenario_id).execute()
+                    assump_id = existing.data[0].get("id")
+                    if assump_id:
+                        db.client.table("assumptions").update({"data": assumptions_data}).eq("id", assump_id).execute()
+                    else:
+                        db.client.table("assumptions").update({"data": assumptions_data}).eq("scenario_id", scenario_id).execute()
                 else:
-                    db.client.table("assumptions").insert(
-                        {"scenario_id": scenario_id, "data": assumptions_data}
-                    ).execute()
+                    # DB schema varies: some deployments include assumptions.user_id, others do not.
+                    try:
+                        db.client.table("assumptions").insert(
+                            {"scenario_id": scenario_id, "user_id": user_id, "data": assumptions_data}
+                        ).execute()
+                    except Exception as insert_err:
+                        msg = str(insert_err).lower()
+                        if ("user_id" in msg and "column" in msg) or ("could not find the" in msg and "user_id" in msg):
+                            db.client.table("assumptions").insert(
+                                {"scenario_id": scenario_id, "data": assumptions_data}
+                            ).execute()
+                        else:
+                            raise
                 st.success("✅ Assumptions saved!")
                 st.rerun()
             except Exception as e:
@@ -742,7 +756,7 @@ def render_step_historics(db, scenario_id: str, user_id: str):
             st.info("⬜ CF Line Items")
 
     st.markdown("---")
-    sub_tabs = st.tabs(["Income Statement", "Balance Sheet", "Cash Flow"])
+    sub_tabs = st.tabs(["Income Statement", "Balance Sheet", "Cash Flow", "Sales Orders (Optional)"])
 
     with sub_tabs[0]:
         st.markdown("### Income Statement Line Items")
@@ -788,6 +802,117 @@ def render_step_historics(db, scenario_id: str, user_id: str):
             render_import_with_mapping(db, user_id, "historical_cashflow_line_items", scenario_id)
         else:
             st.warning("Column mapper not available")
+
+    with sub_tabs[3]:
+        st.markdown("### Sales Orders (Historical)")
+        st.caption("Optional: import sales order lines to derive seasonality + Wear vs Refurb revenue split.")
+
+        so_cols = ["order_date", "customer_name", "item_code", "description", "quantity", "unit_price", "discount_pct", "total_amount"]
+        so_df = load_table_data(db, "sales_orders", user_id, scenario_id, columns=so_cols)
+
+        if not so_df.empty:
+            st.success(f"✅ {len(so_df)} sales order lines loaded")
+            try:
+                so_df["order_date"] = pd.to_datetime(so_df["order_date"], errors="coerce")
+                min_dt = so_df["order_date"].min()
+                max_dt = so_df["order_date"].max()
+                st.write(f"Date range: **{min_dt.date() if pd.notna(min_dt) else '—'}** → **{max_dt.date() if pd.notna(max_dt) else '—'}**")
+                st.write(f"Total value: **R {pd.to_numeric(so_df['total_amount'], errors='coerce').fillna(0).sum():,.0f}**")
+            except Exception:
+                pass
+
+            with st.expander("📋 View Current Sales Orders (sample)", expanded=False):
+                st.dataframe(so_df.head(200), use_container_width=True, hide_index=True)
+
+            if st.button("🗑️ Clear Sales Orders", key="clear_sales_orders"):
+                if clear_table_data(db, "sales_orders", user_id, scenario_id):
+                    st.success("Cleared!")
+                    st.rerun()
+        else:
+            st.info("No sales orders loaded yet (optional).")
+
+        st.markdown("---")
+        if COLUMN_MAPPER_AVAILABLE:
+            render_import_with_mapping(db, user_id, "sales_orders", scenario_id)
+        else:
+            st.warning("Column mapper not available")
+
+        # ---------------------------------------------------------------------
+        # Wear vs Refurb split (derived from sales orders)
+        # ---------------------------------------------------------------------
+        st.markdown("---")
+        st.markdown("### Wear vs Refurb Revenue Split (Derived)")
+        st.caption("This will be saved to assumptions and used to populate historical revenue detail where only total revenue exists.")
+
+        try:
+            assumptions = {}
+            if hasattr(db, "get_scenario_assumptions"):
+                assumptions = db.get_scenario_assumptions(scenario_id, user_id) or {}
+            existing_split = assumptions.get("historical_revenue_split") or {}
+        except Exception:
+            assumptions = {}
+            existing_split = {}
+
+        if isinstance(existing_split, dict) and existing_split.get("generated_at"):
+            overall = (existing_split.get("overall") or {}) if isinstance(existing_split.get("overall"), dict) else {}
+            st.success(
+                f"✅ Split saved (generated_at: `{existing_split.get('generated_at')}`) — "
+                f"Wear {float(overall.get('wear_share', 0.0)) * 100:.1f}% / "
+                f"Refurb {float(overall.get('service_share', 0.0)) * 100:.1f}%"
+            )
+            with st.expander("View saved split (JSON)", expanded=False):
+                st.json(existing_split)
+        else:
+            st.info("No saved split yet. Compute it from imported Sales Orders below.")
+
+        col_a, col_b = st.columns([2, 1])
+        with col_a:
+            unknown_alloc = st.selectbox(
+                "Unknown-line allocation",
+                options=["pro_rata", "wear", "service", "ignore"],
+                index=0,
+                help="How to allocate sales lines that cannot be classified from item/description text."
+            )
+        with col_b:
+            default_wear = st.slider(
+                "Default wear % (fallback)",
+                min_value=0,
+                max_value=100,
+                value=70,
+                step=5,
+                help="Used only if there are no classifiable lines."
+            )
+
+        if st.button("🤖 Compute & Save Split from Sales Orders", type="primary", use_container_width=True, key="compute_sales_split_btn"):
+            try:
+                from services.sales_split_service import (
+                    load_sales_orders_df,
+                    compute_sales_split_from_orders,
+                    save_sales_split_to_assumptions,
+                )
+
+                sales_df = load_sales_orders_df(db, scenario_id, user_id)
+                if sales_df.empty:
+                    st.error("No sales orders found for this scenario. Import sales orders first.")
+                else:
+                    res = compute_sales_split_from_orders(
+                        sales_df,
+                        unknown_allocation=unknown_alloc,
+                        default_wear_share=float(default_wear) / 100.0,
+                    )
+                    ok = save_sales_split_to_assumptions(db, scenario_id, user_id, res.split_data)
+                    if ok:
+                        st.success("✅ Saved split into assumptions (`historical_revenue_split`).")
+                        with st.expander("Monthly split (computed)", expanded=True):
+                            view = res.monthly.copy()
+                            if "period" in view.columns:
+                                view["period"] = pd.to_datetime(view["period"], errors="coerce").dt.strftime("%Y-%m")
+                            st.dataframe(view, use_container_width=True, hide_index=True)
+                        st.rerun()
+                    else:
+                        st.error("Failed to save split to assumptions.")
+            except Exception as e:
+                st.error(f"Split computation failed: {e}")
 
 
 def render_step_costs(db, scenario_id: str, user_id: str):

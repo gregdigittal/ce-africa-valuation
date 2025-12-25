@@ -568,6 +568,103 @@ FIELD_CONFIGS = {
             }
         }
     },
+
+    # -------------------------------------------------------------------------
+    # SALES ORDERS (HISTORICAL)
+    # -------------------------------------------------------------------------
+    # Used for:
+    # - monthly seasonality pattern extraction (upsampling)
+    # - apportioning historical revenue into Wear Parts vs Refurbishment/Service
+    'sales_orders': {
+        'display_name': 'Sales Orders (Historical)',
+        'icon': '🧾',
+        'description': 'Historical sales order lines (seasonality + wear vs refurb split)',
+        'table': 'sales_orders',
+        'requires_scenario': True,
+        'fields': {
+            'order_number': {
+                'label': 'Order Number',
+                'required': False,
+                'type': 'text',
+                'description': 'Sales order / document number',
+                'hints': ['order', 'order_number', 'so', 'doc', 'document', 'number', 'ref']
+            },
+            'order_date': {
+                'label': 'Order Date',
+                'required': True,
+                'type': 'date',
+                'description': 'Order/invoice date',
+                'hints': ['order_date', 'date', 'doc_date', 'invoice_date', 'posting_date']
+            },
+            'due_date': {
+                'label': 'Due Date',
+                'required': False,
+                'type': 'date',
+                'description': 'Due date (optional)',
+                'hints': ['due_date', 'due', 'payment_due', 'pay_date']
+            },
+            'customer_code': {
+                'label': 'Customer Code',
+                'required': False,
+                'type': 'text',
+                'description': 'Customer code (optional)',
+                'hints': ['customer_code', 'cust_code', 'account_code', 'debtor_code']
+            },
+            'customer_name': {
+                'label': 'Customer Name',
+                'required': False,
+                'type': 'text',
+                'description': 'Customer name',
+                'hints': ['customer', 'customer_name', 'client', 'name']
+            },
+            'item_code': {
+                'label': 'Item Code / SKU',
+                'required': False,
+                'type': 'text',
+                'description': 'Item / SKU code',
+                'hints': ['item', 'item_code', 'sku', 'product_code', 'part', 'part_sku', 'material']
+            },
+            'description': {
+                'label': 'Description',
+                'required': False,
+                'type': 'text',
+                'description': 'Line description',
+                'hints': ['description', 'desc', 'item_description', 'narration']
+            },
+            'quantity': {
+                'label': 'Quantity',
+                'required': False,
+                'type': 'number',
+                'description': 'Quantity',
+                'hints': ['qty', 'quantity', 'units']
+            },
+            'unit_price': {
+                'label': 'Unit Price',
+                'required': False,
+                'type': 'number',
+                'description': 'Unit price',
+                'hints': ['unit_price', 'price', 'rate', 'unitprice']
+            },
+            'discount_pct': {
+                'label': 'Discount %',
+                'required': False,
+                'type': 'number',
+                'description': 'Discount percentage (optional)',
+                'hints': ['discount', 'discount_pct', 'disc', 'rebate']
+            },
+            'total_amount': {
+                'label': 'Total Amount',
+                'required': True,
+                'type': 'number',
+                'description': 'Line total amount (positive for sales)',
+                'hints': [
+                    'total', 'total_amount', 'amount', 'line_total', 'value', 'net_amount',
+                    # common exports (e.g. "Order Tot", "Confirm Tot")
+                    'tot', 'order tot', 'order_tot', 'confirm tot', 'confirm_tot'
+                ]
+            },
+        }
+    },
     
     # -------------------------------------------------------------------------
     # HISTORICAL FINANCIALS
@@ -1178,6 +1275,7 @@ CSV_TEMPLATES = {
     'installed_base': 'machine_id,customer_name,site_name,machine_model,commission_date\nM001,Customer A,Site 1,Model X,2023-01-15',
     'wear_profiles': 'machine_model,liner_life_months,refurb_interval_months,avg_consumable_revenue,avg_refurb_revenue,gross_margin_liner,gross_margin_refurb\nModel X,12,36,50000,200000,0.35,0.28',
     'prospects': 'customer_name,site_name,machine_model,expected_commission_date,probability,annual_liner_value,refurb_value\nProspect A,Site 1,Model X,2025-06-01,75,60000,250000',
+    'sales_orders': 'order_number,order_date,due_date,customer_code,customer_name,item_code,description,quantity,unit_price,discount_pct,total_amount\nSO-1001,2024-01-15,2024-02-14,CUST001,Example Customer,LINER-001,Wear liner segment,2,50000,0,100000\nSO-1002,2024-01-20,2024-02-19,CUST001,Example Customer,SVC-001,Refurbishment service,1,75000,0,75000',
     'historic_financials': 'month,revenue,cogs,gross_profit,opex,ebit\n2024-01-01,1000000,600000,400000,200000,200000',
     'historic_customer_revenue': 'month,customer_code,customer_name,revenue\n2024-01-01,CUST001,Customer A,50000',
     'historic_balance_sheet': 'month,cash_and_equivalents,accounts_receivable,inventory,total_assets,accounts_payable,total_liabilities,share_capital,retained_earnings,total_equity\n2024-12-31,500000,300000,200000,5000000,150000,2000000,2000000,1000000,3000000',
@@ -1819,6 +1917,7 @@ def build_record(
         'installed_base': build_installed_base_record,
         'wear_profiles': build_wear_profile_record,
         'prospects': build_prospect_record,
+        'sales_orders': build_sales_order_record,
         'historic_financials': build_historic_financials_record,
         'historic_customer_revenue': build_historic_customer_revenue_record,
         'historic_balance_sheet': build_historic_balance_sheet_record,
@@ -2004,6 +2103,42 @@ def build_prospect_record(row: pd.Series, user_id: str, scenario_id: str) -> Opt
         'annual_liner_value': parse_number(row.get('annual_liner_value'), 0),
         'refurb_value': parse_number(row.get('refurb_value'), 0)
     }
+
+
+def build_sales_order_record(row: pd.Series, user_id: str, scenario_id: str) -> Optional[Dict]:
+    """Build sales_orders record (historical sales order lines)."""
+    order_date = parse_date(row.get('order_date'))
+    total_amount = parse_number(row.get('total_amount'), default=float("nan"))
+
+    if not order_date or pd.isna(total_amount):
+        return None
+
+    # Optional numeric fields
+    quantity = parse_number(row.get('quantity'), default=float("nan"))
+    unit_price = parse_number(row.get('unit_price'), default=float("nan"))
+    discount_pct = parse_number(row.get('discount_pct'), default=float("nan"))
+
+    rec: Dict[str, Any] = {
+        'scenario_id': scenario_id,
+        'user_id': user_id,
+        'order_number': clean_string(row.get('order_number'), 60),
+        'order_date': order_date,
+        'due_date': parse_date(row.get('due_date')),
+        'customer_code': clean_string(row.get('customer_code'), 60),
+        'customer_name': clean_string(row.get('customer_name'), 200),
+        'item_code': clean_string(row.get('item_code'), 120),
+        'description': clean_string(row.get('description'), 400),
+        'total_amount': float(total_amount),
+    }
+
+    if not pd.isna(quantity):
+        rec['quantity'] = float(quantity)
+    if not pd.isna(unit_price):
+        rec['unit_price'] = float(unit_price)
+    if not pd.isna(discount_pct):
+        rec['discount_pct'] = float(discount_pct)
+
+    return rec
 
 
 def build_historic_financials_record(row: pd.Series, user_id: str, scenario_id: str) -> Optional[Dict]:

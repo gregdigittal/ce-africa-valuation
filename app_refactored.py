@@ -1128,7 +1128,7 @@ def render_navigation():
         elif section_id == 'ai_assumptions':
             # Only add once (covers both ai_analysis and assumptions_review)
             if not any(s[0] == 'ai_assumptions' for s in sections):
-                sections.append(('ai_assumptions', 'AI Assumptions', stage_id))
+                sections.append(('ai_assumptions', 'Assumptions & Forecast Config', stage_id))
         elif section_id == 'forecast':
             # Only add once (covers both forecast and results stages)
             if not any(s[0] == 'forecast' for s in sections):
@@ -1207,9 +1207,9 @@ def render_navigation():
                 st.session_state.current_section = section_id
                 st.rerun()
     
-    # Note about required step
+    # Note about AI step
     if AI_ASSUMPTIONS_AVAILABLE:
-        st.sidebar.caption("* Required before Forecast")
+        st.sidebar.caption("* Recommended (required for Trend/Hybrid configuration)")
 
 
 def handle_navigation():
@@ -1230,29 +1230,56 @@ def handle_navigation():
 # =============================================================================
 
 def check_assumptions_saved(db, scenario_id: str) -> bool:
-    """Check if AI assumptions have been saved for this scenario."""
+    """
+    Check if AI assumptions have been saved for this scenario.
+    
+    NOTE: This is intentionally not used to gate Pipeline forecasts. Forecast gating
+    is handled inside the Forecast section based on the selected forecast method.
+    """
     if not AI_ASSUMPTIONS_AVAILABLE:
         return True  # Skip check if module not available
-    
-    assumptions = get_saved_assumptions(db, scenario_id)
-    if assumptions is None:
-        return False
-    
-    return getattr(assumptions, 'assumptions_saved', False)
+
+    # Provide user_id for RLS compliance when available
+    user_id = None
+    try:
+        user_id = get_user_id()
+    except Exception:
+        user_id = None
+
+    assumptions_set = get_saved_assumptions(db, scenario_id, user_id)
+    if assumptions_set is not None and getattr(assumptions_set, 'assumptions_saved', False):
+        return True
+
+    # Also treat unified config save as "assumptions review complete" for workflow purposes
+    try:
+        if user_id and hasattr(db, "get_scenario_assumptions"):
+            a = db.get_scenario_assumptions(scenario_id, user_id) or {}
+            if a.get("assumptions_saved"):
+                return True
+            unified_cfg = a.get("unified_line_item_config") or {}
+            if isinstance(unified_cfg, dict) and unified_cfg.get("last_updated"):
+                return True
+            if a.get("ai_assumptions_saved"):
+                return True
+    except Exception:
+        pass
+
+    return False
 
 
 def render_assumptions_required_warning():
-    """Render a warning when assumptions are required but not saved."""
+    """Render a warning when additional assumptions/configuration are required."""
     st.warning("""
-    ⚠️ **AI Assumptions Required**
+    ⚠️ **Assumptions / Forecast Configuration Required**
     
-    Before running the forecast, you must complete the AI Assumptions step:
+    Your selected forecast method requires additional configuration before the forecast can run.
+    
+    **Next steps:**
     1. Go to **AI Assumptions** in the sidebar
-    2. Click **Run AI Analysis** to analyze historical data
-    3. Review and adjust the proposed assumptions
-    4. Click **Save Assumptions** to commit
+    2. Use **Configure Assumptions** to set the forecast method (Pipeline / Hybrid / Trend)
+    3. If using **Trend/Hybrid**, configure and save line-item trends
     
-    This ensures your forecast uses data-driven assumptions with proper probability distributions for Monte Carlo simulation.
+    *(Pipeline-only forecasts can run without AI analysis.)*
     """)
     
     col1, col2 = st.columns(2)
@@ -1284,7 +1311,9 @@ WORKFLOW_STAGES = [
         'name': 'AI Analysis',
         'section': 'ai_assumptions',
         'description': 'Run AI analysis on historical data',
-        'required': True,
+        # AI analysis is valuable but should not block a Pipeline forecast.
+        # Trend/Hybrid methods enforce their own prerequisites in the Forecast UI.
+        'required': False,
         'prerequisites': ['setup']
     },
     {
@@ -1292,8 +1321,9 @@ WORKFLOW_STAGES = [
         'name': 'Assumptions Review',
         'section': 'ai_assumptions',
         'description': 'Review and save AI-derived assumptions',
-        'required': True,
-        'prerequisites': ['ai_analysis']
+        'required': False,
+        # Keep optional and non-blocking; Forecast gating is handled inside Forecast.
+        'prerequisites': ['setup']
     },
     {
         'id': 'forecast',
@@ -1301,7 +1331,8 @@ WORKFLOW_STAGES = [
         'section': 'forecast',
         'description': 'Run financial forecast',
         'required': True,
-        'prerequisites': ['assumptions_review']
+        # Pipeline forecasts should be runnable after Setup.
+        'prerequisites': ['setup']
     },
     {
         'id': 'manufacturing',
@@ -1435,7 +1466,7 @@ def is_workflow_stage_complete(db, scenario_id: str, stage_id: str, user_id: str
         # Check if AI analysis has been run
         try:
             from components.ai_assumptions_engine import load_assumptions_from_db
-            assumptions = load_assumptions_from_db(db, scenario_id)
+            assumptions = load_assumptions_from_db(db, scenario_id, user_id)
             is_actually_complete = assumptions is not None and getattr(assumptions, 'analysis_complete', False)
         except:
             is_actually_complete = False
@@ -1843,7 +1874,7 @@ def render_ai_assumptions_section_wrapper():
         st.warning("AI Assumptions Engine module not available.")
         
         st.markdown("""
-        **This is a REQUIRED step before running the Forecast.**
+        **This step is recommended (and required for Trend/Hybrid configuration).**
         
         **Features:**
         - Analyze historical data to derive assumptions
@@ -1876,14 +1907,8 @@ def render_forecast_section_view():
             # Fallback to old check
             pass
     
-    # Check if assumptions have been saved (unless skipped)
-    skip_check = st.session_state.get('skip_assumptions_check', False)
-    
-    if AI_ASSUMPTIONS_AVAILABLE and not skip_check:
-        if not check_assumptions_saved(db, scenario_id):
-            st.header("Forecast & Analysis")
-            render_assumptions_required_warning()
-            return
+    # Forecast gating is handled inside the Forecast section based on the selected method.
+    # Pipeline forecasts should not be blocked by the AI Assumptions save flag.
     
     # NEW: Show contextual help
     try:

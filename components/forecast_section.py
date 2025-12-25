@@ -1314,34 +1314,122 @@ def load_forecast_data(db, scenario_id: str, user_id: str = None, force_refresh:
         data['historical_financials'] = load_historical_financials(db, scenario_id, user_id)
         
         # Try machine_instances first (new schema from Sprint 2)
+        # IMPORTANT: Do not rely on a 'wear_profiles_v2' relationship existing in PostgREST.
+        # Some DB schemas only have `wear_profiles` and no `wear_profiles_v2` view.
         try:
-            machines = db.client.table(TABLE_MACHINE_INSTANCES).select(
-                '*, sites(site_name, ore_type_id, customers(customer_name)), '
-                'wear_profiles_v2(profile_name, liner_life_months, avg_consumable_revenue, '
-                'refurb_interval_months, avg_refurb_revenue, ore_type_id, gross_margin_liner, gross_margin_refurb)'
-            ).eq('scenario_id', scenario_id).eq('status', 'Active').execute()
-            
-            if machines.data and len(machines.data) > 0:
-                data['machines'] = machines.data
-                data['data_source'] = 'machine_instances'
+            machines = []
+            if hasattr(db, "get_machine_instances") and user_id:
+                machines = db.get_machine_instances(user_id, scenario_id) or []
+            elif hasattr(db, "client"):
+                # Fallback query (no nested wear profile)
+                resp = db.client.table(TABLE_MACHINE_INSTANCES).select(
+                    '*, sites(site_name, ore_type_id, customers(customer_name)), machine_models(code, name)'
+                ).eq('scenario_id', scenario_id).execute()
+                machines = resp.data or []
+
+            # Filter active status robustly (DBs often store 'active' not 'Active')
+            active_machines = []
+            for m in machines:
+                status_val = str(m.get("status", "") or "").strip().lower()
+                if status_val in ("active", "1", "true", "yes", ""):
+                    active_machines.append(m)
+
+            if active_machines:
+                # Load wear profiles for this user and attach to each machine as `wear_profiles_v2`
+                profiles = []
+                try:
+                    if hasattr(db, "client") and user_id:
+                        p = db.client.table(TABLE_WEAR_PROFILES).select(
+                            "machine_model, machine_model_id, ore_type_id, liner_life_months, avg_consumable_revenue, "
+                            "refurb_interval_months, avg_refurb_revenue, gross_margin_liner, gross_margin_refurb"
+                        ).eq("user_id", user_id).execute()
+                        profiles = p.data or []
+                except Exception:
+                    profiles = []
+
+                # Build lookup maps
+                prof_by_model_ore = {}
+                prof_by_model = {}
+                prof_by_name = {}
+                for pr in profiles:
+                    mmid = pr.get("machine_model_id")
+                    ore = pr.get("ore_type_id")
+                    if mmid and ore:
+                        prof_by_model_ore[(str(mmid), str(ore))] = pr
+                    if mmid:
+                        prof_by_model[str(mmid)] = pr
+                    name = (pr.get("machine_model") or "").strip()
+                    if name:
+                        prof_by_name[name.lower()] = pr
+
+                enriched = []
+                for m in active_machines:
+                    # Machine model info
+                    mmid = m.get("machine_model_id")
+                    model_name = ""
+                    try:
+                        mm = m.get("machine_models") or {}
+                        model_name = (mm.get("name") or mm.get("code") or "").strip()
+                    except Exception:
+                        model_name = ""
+
+                    ore_id = None
+                    try:
+                        site = m.get("sites") or {}
+                        ore_id = site.get("ore_type_id")
+                    except Exception:
+                        ore_id = None
+
+                    profile = {}
+                    try:
+                        if mmid and ore_id and (str(mmid), str(ore_id)) in prof_by_model_ore:
+                            profile = prof_by_model_ore[(str(mmid), str(ore_id))]
+                        elif mmid and str(mmid) in prof_by_model:
+                            profile = prof_by_model[str(mmid)]
+                        elif model_name and model_name.lower() in prof_by_name:
+                            profile = prof_by_name[model_name.lower()]
+                    except Exception:
+                        profile = {}
+
+                    m2 = dict(m)
+                    m2["wear_profiles_v2"] = {
+                        "liner_life_months": (profile or {}).get("liner_life_months", 6),
+                        "avg_consumable_revenue": (profile or {}).get("avg_consumable_revenue", 50000),
+                        "refurb_interval_months": (profile or {}).get("refurb_interval_months", 36),
+                        "avg_refurb_revenue": (profile or {}).get("avg_refurb_revenue", 150000),
+                        "gross_margin_liner": (profile or {}).get("gross_margin_liner", 0.38),
+                        "gross_margin_refurb": (profile or {}).get("gross_margin_refurb", 0.32),
+                    }
+                    enriched.append(m2)
+
+                data["machines"] = enriched
+                data["data_source"] = "machine_instances"
             else:
                 raise Exception("machine_instances empty, trying fallback")
-        except:
+        except Exception:
             # FALLBACK: Query installed_base table (legacy schema)
             try:
                 installed_base = db.client.table(TABLE_INSTALLED_BASE).select('*').eq('scenario_id', scenario_id).execute()
-                
+
                 if installed_base.data and len(installed_base.data) > 0:
-                    # Load wear profiles
-                    wear_profiles_result = db.client.table(TABLE_WEAR_PROFILES).select('*').execute()
-                    wear_profile_dict = {p.get('machine_model', ''): p for p in (wear_profiles_result.data or [])}
-                    
+                    # Load wear profiles (user-scoped if possible)
+                    wear_profiles_result = None
+                    try:
+                        if user_id:
+                            wear_profiles_result = db.client.table(TABLE_WEAR_PROFILES).select('*').eq('user_id', user_id).execute()
+                        else:
+                            wear_profiles_result = db.client.table(TABLE_WEAR_PROFILES).select('*').execute()
+                    except Exception:
+                        wear_profiles_result = db.client.table(TABLE_WEAR_PROFILES).select('*').execute()
+
+                    wear_profile_dict = {str(p.get('machine_model', '') or '').strip().lower(): p for p in (wear_profiles_result.data or [])}
+
                     # Transform installed_base format to expected format
                     transformed_machines = []
                     for machine in installed_base.data:
-                        model = machine.get('machine_model', '') or machine.get('Model', '')
-                        profile = wear_profile_dict.get(model, {})
-                        
+                        model = (machine.get('machine_model', '') or machine.get('Model', '') or '').strip()
+                        profile = wear_profile_dict.get(model.lower(), {})
+
                         transformed_machines.append({
                             'id': machine.get('id'),
                             'machine_id': machine.get('machine_id'),
@@ -1349,7 +1437,7 @@ def load_forecast_data(db, scenario_id: str, user_id: str = None, force_refresh:
                             'site_name': machine.get('site_name', machine.get('Site', '')),
                             'machine_model': model,
                             'commission_date': machine.get('commission_date', machine.get('Commission Date')),
-                            'status': machine.get('status', 'Active'),
+                            'status': machine.get('status', 'active'),
                             'wear_profiles_v2': {
                                 'liner_life_months': profile.get('liner_life_months', 6),
                                 'avg_consumable_revenue': profile.get('avg_consumable_revenue', 50000),
@@ -1360,10 +1448,10 @@ def load_forecast_data(db, scenario_id: str, user_id: str = None, force_refresh:
                             },
                             '_source': 'installed_base'
                         })
-                    
+
                     data['machines'] = transformed_machines
                     data['data_source'] = 'installed_base'
-            except Exception as fallback_error:
+            except Exception:
                 pass  # Will be handled below
         
         # =================================================================
@@ -1456,79 +1544,74 @@ def run_forecast(db, scenario_id: str, user_id: str, progress_callback=None,
         
         data = load_forecast_data(db, scenario_id, user_id)
         
-        # Add trend forecast configuration if enabled
-        # Get value from session state (set by checkbox widget)
-        use_trend_forecast = st.session_state.get('use_trend_forecast', False)
+        # Add historical data for trend calculation when Trend/Hybrid is selected.
+        # We intentionally avoid using session_state toggles here; the forecast_method
+        # and use_trend_forecast flags are persisted in the scenario assumptions.
+        try:
+            forecast_method = (data.get('assumptions') or {}).get('forecast_method', 'pipeline')
+            use_trend_forecast = bool((data.get('assumptions') or {}).get('use_trend_forecast', False)) or (forecast_method in ('trend', 'hybrid'))
+            data['assumptions']['use_trend_forecast'] = use_trend_forecast
+        except Exception:
+            forecast_method = 'pipeline'
+            use_trend_forecast = False
+
         if use_trend_forecast:
+            # Ensure we have the freshest trend config from DB (covers legacy trend tabs too)
             assumptions_data = db.get_scenario_assumptions(scenario_id, user_id) if hasattr(db, 'get_scenario_assumptions') else {}
-            
-            # Check for forecast_configs (new format from Trend Forecast tab)
-            forecast_configs = assumptions_data.get('forecast_configs', {})
-            # Also check legacy trend_forecasts for backward compatibility
-            trend_forecasts = assumptions_data.get('trend_forecasts', {})
-            
-            if forecast_configs or trend_forecasts:
-                data['assumptions']['use_trend_forecast'] = True
-                # Use forecast_configs if available, otherwise fall back to trend_forecasts
-                if forecast_configs:
-                    data['assumptions']['forecast_configs'] = forecast_configs
-                if trend_forecasts:
-                    data['assumptions']['trend_forecasts'] = trend_forecasts
-                
-                # Add historical data for trend calculation
-                # Use the same data loading logic as AI Assumptions (includes aggregation from line items)
+            forecast_configs = assumptions_data.get('forecast_configs', {}) or {}
+            trend_forecasts = assumptions_data.get('trend_forecasts', {}) or {}
+            if forecast_configs:
+                data['assumptions']['forecast_configs'] = forecast_configs
+            if trend_forecasts:
+                data['assumptions']['trend_forecasts'] = trend_forecasts
+
+            # Add historical data for any trend-fit method (legacy + correlation engine).
+            # Use the same loader as AI Assumptions to ensure detailed-line-items are aggregated.
+            try:
+                from components.ai_assumptions_engine import load_historical_data
+                hist_df = load_historical_data(db, scenario_id, user_id)
+
+                if not hist_df.empty:
+                    hist_df_mapped = hist_df.copy()
+
+                    # Map total_* columns to base names if base names don't exist
+                    column_mapping = {
+                        'total_revenue': 'revenue',
+                        'total_cogs': 'cogs',
+                        'total_opex': 'opex',
+                        'total_gross_profit': 'gross_profit'
+                    }
+
+                    for old_name, new_name in column_mapping.items():
+                        if old_name in hist_df_mapped.columns and new_name not in hist_df_mapped.columns:
+                            hist_df_mapped[new_name] = hist_df_mapped[old_name]
+
+                    # ForecastEngine expects 'historic_financials' (legacy key)
+                    data['historic_financials'] = hist_df_mapped
+
+                    # Add historical revenue series for legacy support
+                    revenue_col = 'revenue' if 'revenue' in hist_df_mapped.columns else ('total_revenue' if 'total_revenue' in hist_df_mapped.columns else None)
+                    if revenue_col:
+                        if 'month' in hist_df_mapped.columns:
+                            data['historical_revenue'] = hist_df_mapped.set_index('month')[revenue_col].sort_index()
+                        elif 'period_date' in hist_df_mapped.columns:
+                            data['historical_revenue'] = hist_df_mapped.set_index('period_date')[revenue_col].sort_index()
+                        else:
+                            data['historical_revenue'] = hist_df_mapped[revenue_col]
+            except Exception:
+                # Fallback: legacy summary table
                 try:
-                    from components.ai_assumptions_engine import load_historical_data
-                    hist_df = load_historical_data(db, scenario_id, user_id)
-                    
-                    if not hist_df.empty:
-                        # Ensure column names match what forecast engine expects
-                        # The forecast engine looks for: revenue, cogs, opex, gross_profit, etc.
-                        # Map common column name variations
-                        hist_df_mapped = hist_df.copy()
-                        
-                        # Map total_* columns to base names if base names don't exist
-                        column_mapping = {
-                            'total_revenue': 'revenue',
-                            'total_cogs': 'cogs',
-                            'total_opex': 'opex',
-                            'total_gross_profit': 'gross_profit'
-                        }
-                        
-                        for old_name, new_name in column_mapping.items():
-                            if old_name in hist_df_mapped.columns and new_name not in hist_df_mapped.columns:
-                                hist_df_mapped[new_name] = hist_df_mapped[old_name]
-                        
-                        data['historic_financials'] = hist_df_mapped
-                        
-                        # Add historical revenue series for legacy support
-                        revenue_col = None
-                        if 'revenue' in hist_df_mapped.columns:
-                            revenue_col = 'revenue'
-                        elif 'total_revenue' in hist_df_mapped.columns:
-                            revenue_col = 'total_revenue'
-                        
-                        if revenue_col:
-                            if 'month' in hist_df_mapped.columns:
-                                data['historical_revenue'] = hist_df_mapped.set_index('month')[revenue_col].sort_index()
-                            elif 'period_date' in hist_df_mapped.columns:
-                                data['historical_revenue'] = hist_df_mapped.set_index('period_date')[revenue_col].sort_index()
+                    hist_financials = db.get_historic_financials(scenario_id)
+                    if hist_financials:
+                        hist_df = pd.DataFrame(hist_financials)
+                        data['historic_financials'] = hist_df
+                        if 'revenue' in hist_df.columns:
+                            if 'month' in hist_df.columns:
+                                data['historical_revenue'] = hist_df.set_index('month')['revenue'].sort_index()
                             else:
-                                data['historical_revenue'] = hist_df_mapped[revenue_col]
-                except Exception as e:
-                    # Fallback to old method if new method fails
-                    try:
-                        hist_financials = db.get_historic_financials(scenario_id)
-                        if hist_financials:
-                            hist_df = pd.DataFrame(hist_financials)
-                            data['historic_financials'] = hist_df
-                            if 'revenue' in hist_df.columns:
-                                if 'month' in hist_df.columns:
-                                    data['historical_revenue'] = hist_df.set_index('month')['revenue'].sort_index()
-                                else:
-                                    data['historical_revenue'] = hist_df['revenue']
-                    except Exception:
-                        pass
+                                data['historical_revenue'] = hist_df['revenue']
+                except Exception:
+                    pass
         
         # Verify forecast_configs are loaded (silent check - errors will be shown if forecast fails)
         
@@ -1538,11 +1621,11 @@ def run_forecast(db, scenario_id: str, user_id: str, progress_callback=None,
         # Add data_source to results (from load_forecast_data)
         results['data_source'] = data.get('data_source', 'unknown')
         
-        # Add forecast method to results
-        if st.session_state.get('use_trend_forecast', False):
-            results['forecast_method'] = 'trend_based'
-        else:
-            results['forecast_method'] = 'pipeline_based'
+        # Add forecast method to results (single source of truth: saved assumptions)
+        try:
+            results['forecast_method'] = (data.get('assumptions') or {}).get('forecast_method', 'pipeline')
+        except Exception:
+            results['forecast_method'] = 'pipeline'
         
         # NEW: Generate detailed line item forecasts
         try:
@@ -2495,6 +2578,15 @@ def build_monthly_financials(
     
     # Add historical data first if available
     if historical_data is not None and not historical_data.empty:
+        # Optional: sales-order-derived split for Wear vs Refurb revenue detail
+        split_cfg = {}
+        try:
+            split_cfg = assumptions.get("historical_revenue_split") or {}
+        except Exception:
+            split_cfg = {}
+        split_by_period = split_cfg.get("by_period") if isinstance(split_cfg, dict) else None
+        split_overall = split_cfg.get("overall") if isinstance(split_cfg, dict) else None
+
         for _, row in historical_data.iterrows():
             period_date = row.get('period_date')
             if period_date is not None:
@@ -2534,6 +2626,34 @@ def build_monthly_financials(
                 ebt = row.get('ebt', ebit - interest_expense) or 0
                 tax_expense = row.get('tax', row.get('tax_expense', 0)) or 0
                 net_income = row.get('net_income', ebt - tax_expense) or 0
+
+                # Revenue totals
+                total_revenue_val = row.get('total_revenue', row.get('revenue', 0)) or 0
+
+                # Default revenue detail (if no split available)
+                rev_wear_existing = 0.0
+                rev_service_existing = 0.0
+
+                # Apply saved sales split if available
+                try:
+                    if isinstance(split_by_period, dict) and pd.notna(period_date):
+                        key = pd.to_datetime(period_date).strftime("%Y-%m")
+                        cfg = split_by_period.get(key)
+                        wear_share = None
+                        service_share = None
+                        if isinstance(cfg, dict):
+                            wear_share = cfg.get("wear_share")
+                            service_share = cfg.get("service_share")
+                        if wear_share is None and isinstance(split_overall, dict):
+                            wear_share = split_overall.get("wear_share")
+                            service_share = split_overall.get("service_share")
+                        if wear_share is not None:
+                            ws = float(wear_share)
+                            ss = float(service_share) if service_share is not None else float(1 - ws)
+                            rev_wear_existing = float(total_revenue_val) * ws
+                            rev_service_existing = float(total_revenue_val) * ss
+                except Exception:
+                    pass
                 
                 all_rows.append({
                     'period_year': period_date.year,
@@ -2543,7 +2663,7 @@ def build_monthly_financials(
                     'is_actual': is_actual,
                     'data_type': data_type,
                     'is_annual_total': False,
-                    'total_revenue': row.get('total_revenue', row.get('revenue', 0)) or 0,
+                    'total_revenue': total_revenue_val,
                     'total_cogs': row.get('total_cogs', row.get('cogs', 0)) or 0,
                     # Manufacturing cost breakdown (zeros for historical)
                     'cogs_buy': row.get('total_cogs', row.get('cogs', 0)) or 0,  # All COGS is "buy" in historical
@@ -2558,11 +2678,11 @@ def build_monthly_financials(
                     'ebit': ebit,
                     'net_income': net_income,
                     # Revenue detail (historical doesn't have this breakdown)
-                    'rev_wear_existing': 0,
-                    'rev_service_existing': 0,
+                    'rev_wear_existing': rev_wear_existing,
+                    'rev_service_existing': rev_service_existing,
                     'rev_wear_prospect': 0,
                     'rev_service_prospect': 0,
-                    'revenue_existing': row.get('total_revenue', row.get('revenue', 0)) or 0,
+                    'revenue_existing': total_revenue_val,
                     'revenue_prospect': 0,
                     # Expense detail from historic_expense_categories (v8.3 fix)
                     'opex_personnel': opex_personnel,
@@ -4724,7 +4844,7 @@ def render_run_forecast_tab(db, scenario_id: str, user_id: str):
         metric_card("Refurb Margin", f"{margin_r}%" if margin_r > 1 else f"{margin_r*100:.0f}%")
     
     # ==========================================================================
-    # FORECAST METHOD TOGGLE (NEW - Clear selection between Pipeline and Trend)
+    # FORECAST METHOD TOGGLE (Single source of truth)
     # ==========================================================================
     st.markdown("### 🔀 Forecast Method")
     
@@ -4734,36 +4854,53 @@ def render_run_forecast_tab(db, scenario_id: str, user_id: str):
     col_method1, col_method2 = st.columns(2)
     
     with col_method1:
-        use_pipeline = st.radio(
+        selected_method = st.radio(
             "Select Forecast Method",
-            options=['pipeline', 'trend'],
-            format_func=lambda x: '📈 **Pipeline-Based** (Fleet + Prospects)' if x == 'pipeline' else '📊 **Trend-Based** (Historical Trends)',
-            index=0 if current_method == 'pipeline' else 1,
+            options=['pipeline', 'hybrid', 'trend'],
+            format_func=lambda x: (
+                '📈 **Pipeline-Based** (Fleet + Prospects)' if x == 'pipeline'
+                else ('🧩 **Hybrid** (Trend Baseline + Pipeline Overlay)' if x == 'hybrid'
+                      else '📊 **Trend-Based** (Line-Item Trends)')
+            ),
+            index=0 if current_method == 'pipeline' else (1 if current_method == 'hybrid' else 2),
             key='forecast_method_toggle',
             horizontal=True,
             help="""
 **Pipeline-Based:** Revenue = Fleet consumables/refurb + Prospect pipeline. 
 Best for installed-base business models with sales pipeline data.
 
-**Trend-Based:** Revenue follows historical trend curves. 
-Best when you have reliable historical financials and want trend-driven forecasts.
+**Hybrid:** Baseline follows configured line-item trends (historical shape), then prospect pipeline is layered on top.
+Best when you want both trend shape **and** explicit pipeline opportunities.
+
+**Trend-Based:** Forecast is driven by configured line-item trends.
+Configure in **AI Assumptions → Configure Assumptions**.
             """
         )
         
         # Save method if changed
-        if use_pipeline != current_method:
-            assumptions['forecast_method'] = use_pipeline
-            assumptions['use_trend_forecast'] = (use_pipeline == 'trend')
+        if selected_method != current_method:
+            assumptions['forecast_method'] = selected_method
+            assumptions['use_trend_forecast'] = (selected_method in ('trend', 'hybrid'))
             db.update_assumptions(scenario_id, user_id, assumptions)
+            # Keep a lightweight session hint for downstream UI (API mode payload)
+            st.session_state['forecast_method'] = selected_method
+            st.session_state['use_trend_forecast'] = bool(assumptions['use_trend_forecast'])
             st.rerun()
     
     with col_method2:
-        if use_pipeline == 'pipeline':
+        if selected_method == 'pipeline':
             st.info("""
 **Pipeline-Based Forecast:**
 - Revenue from fleet wear parts + refurb + prospects
 - COGS from margin percentages
 - OPEX from expense assumptions
+            """)
+        elif selected_method == 'hybrid':
+            st.info("""
+**Hybrid Forecast:**
+- Baseline from trend/line-item configuration
+- Plus prospect pipeline layered on top
+- Configure in **AI Assumptions → Configure Assumptions**
             """)
         else:
             st.info("""
@@ -4786,46 +4923,68 @@ Best when you have reliable historical financials and want trend-driven forecast
         st.info("ℹ️ Using manual/default assumptions. Complete AI Assumptions step for data-driven forecasting.")
     
     st.markdown("---")
+
+    # ==========================================================================
+    # APPLIED ASSUMPTIONS (SUMMARY)
+    # ==========================================================================
+    try:
+        with st.expander("✅ Applied Assumptions (Summary)", expanded=False):
+            fm = (assumptions.get("forecast_method") or "pipeline").lower()
+            st.write(f"- **Forecast method**: `{fm}`")
+            st.write(f"- **Use trend layer**: `{bool(assumptions.get('use_trend_forecast', False))}`")
+
+            unified_cfg = assumptions.get('unified_line_item_config') or {}
+            has_unified = bool(unified_cfg.get('line_items'))
+            st.write(f"- **Unified line-item config present**: `{has_unified}`")
+            if unified_cfg.get("last_updated"):
+                st.write(f"- **Unified last updated**: `{unified_cfg.get('last_updated')}`")
+
+            assumptions_data = db.get_scenario_assumptions(scenario_id, user_id) if hasattr(db, 'get_scenario_assumptions') else {}
+            has_legacy = bool((assumptions_data.get("forecast_configs") or {}) or (assumptions_data.get("trend_forecasts") or {}))
+            st.write(f"- **Legacy trend curves present**: `{has_legacy}`")
+
+            if AI_ASSUMPTIONS_AVAILABLE and ai_assumptions is not None:
+                st.write(f"- **AI analysis complete**: `{bool(getattr(ai_assumptions, 'analysis_complete', False))}`")
+                st.write(f"- **AI assumptions saved**: `{bool(getattr(ai_assumptions, 'assumptions_saved', False))}`")
+    except Exception:
+        pass
     
     # Run options
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("### Forecast Options")
-        
-        # Trend-based forecast option
+
+        # Applied configuration status (clarifies what is required vs optional)
         assumptions_data = db.get_scenario_assumptions(scenario_id, user_id) if hasattr(db, 'get_scenario_assumptions') else {}
-        
-        # Check for forecast_configs (saved from Trend Forecast tab)
-        forecast_configs = assumptions_data.get('forecast_configs', {})
-        # Also check legacy trend_forecasts key for backward compatibility
-        trend_forecasts = assumptions_data.get('trend_forecasts', {})
-        
-        # Has config if either forecast_configs or trend_forecasts exists
-        has_trend_config = bool(forecast_configs) or bool(trend_forecasts)
-        
-        # Initialize session state if not exists
-        if 'use_trend_forecast' not in st.session_state:
-            st.session_state['use_trend_forecast'] = False
-        
-        # If checkbox was enabled but config is missing, disable it
-        if st.session_state.get('use_trend_forecast', False) and not has_trend_config:
-            st.session_state['use_trend_forecast'] = False
-        
-        use_trend_forecast = st.checkbox(
-            "Use Trend-Based Forecast (from Historical Data)",
-            value=st.session_state.get('use_trend_forecast', False),
-            disabled=not has_trend_config,
-            key="use_trend_forecast",
-            help="Use trend analysis from historical financial data instead of pipeline-based growth. Configure in AI Assumptions → Trend Forecast tab."
-        )
-        
-        if use_trend_forecast and has_trend_config:
-            config_keys = list(forecast_configs.keys()) if forecast_configs else list(trend_forecasts.keys())
-            st.success(f"✅ Trend forecast configured for: {', '.join(config_keys[:5])}{'...' if len(config_keys) > 5 else ''}")
-        elif not has_trend_config:
-            st.info("💡 Configure trend forecasts in **AI Assumptions → Trend Forecast** tab to enable this option.")
-        
+        forecast_configs = assumptions_data.get('forecast_configs', {}) or {}
+        trend_forecasts = assumptions_data.get('trend_forecasts', {}) or {}
+        has_legacy_trend_config = bool(forecast_configs) or bool(trend_forecasts)
+
+        unified_cfg = assumptions.get('unified_line_item_config') or {}
+        has_unified_line_items = bool(unified_cfg.get('line_items'))
+        unified_updated = unified_cfg.get('last_updated') or unified_cfg.get('updated_at') or ''
+
+        if selected_method in ('trend', 'hybrid'):
+            if has_unified_line_items:
+                st.success("✅ Line-item trends configured (Unified config)")
+                if unified_updated:
+                    st.caption(f"Unified config last updated: `{unified_updated}`")
+            elif has_legacy_trend_config:
+                st.info("ℹ️ Using legacy Trend Forecast curves (Trend Forecast tab). Consider migrating to Unified config.")
+            else:
+                st.warning("⚠️ Trend/Hybrid selected but no trend configuration found. Go to **AI Assumptions → Configure Assumptions** and save line-item trends.")
+
+        if selected_method == 'pipeline' and has_legacy_trend_config:
+            with st.expander("Legacy Trend Forecast curves detected (optional)", expanded=False):
+                st.info("Legacy trend curves exist but Pipeline method ignores them. Switch to **Hybrid** or **Trend** to apply trends.")
+                try:
+                    keys = list(forecast_configs.keys()) if forecast_configs else list(trend_forecasts.keys())
+                    if keys:
+                        st.caption(f"Configured elements: {', '.join(keys[:8])}{'...' if len(keys) > 8 else ''}")
+                except Exception:
+                    pass
+
         st.markdown("---")
         
         include_monte_carlo = st.checkbox("Include Monte Carlo Simulation", value=True, key="fc_mc_checkbox")
@@ -5072,6 +5231,22 @@ Best when you have reliable historical financials and want trend-driven forecast
                 assumptions_for_gate = {}
                 if hasattr(db, "get_scenario_assumptions"):
                     assumptions_for_gate = db.get_scenario_assumptions(scenario_id, user_id) or {}
+
+                # Gate: Trend/Hybrid requires a saved trend configuration (Unified line items preferred)
+                try:
+                    fm = (assumptions_for_gate.get("forecast_method") or "pipeline").lower()
+                except Exception:
+                    fm = "pipeline"
+                unified_cfg = assumptions_for_gate.get("unified_line_item_config") or {}
+                has_unified = bool(unified_cfg.get("line_items"))
+                has_legacy = bool(assumptions_for_gate.get("forecast_configs") or assumptions_for_gate.get("trend_forecasts"))
+                if fm in ("trend", "hybrid") and not (has_unified or has_legacy):
+                    progress_bar.empty()
+                    status.empty()
+                    st.error("Forecast method requires Trend configuration, but none was found.")
+                    st.info("Go to **AI Assumptions → Configure Assumptions** and save line-item trends (Unified config).")
+                    return
+
                 ok_hist, hist_msgs = validate_historical_import_coverage(db, scenario_id, user_id=user_id, assumptions=assumptions_for_gate)
                 if not ok_hist:
                     progress_bar.empty()
@@ -5131,6 +5306,20 @@ Best when you have reliable historical financials and want trend-driven forecast
                         assumptions_for_gate = {}
                         if hasattr(db, "get_scenario_assumptions"):
                             assumptions_for_gate = db.get_scenario_assumptions(scenario_id, user_id) or {}
+
+                        # Gate: Trend/Hybrid requires a saved trend configuration
+                        try:
+                            fm = (assumptions_for_gate.get("forecast_method") or "pipeline").lower()
+                        except Exception:
+                            fm = "pipeline"
+                        unified_cfg = assumptions_for_gate.get("unified_line_item_config") or {}
+                        has_unified = bool(unified_cfg.get("line_items"))
+                        has_legacy = bool(assumptions_for_gate.get("forecast_configs") or assumptions_for_gate.get("trend_forecasts"))
+                        if fm in ("trend", "hybrid") and not (has_unified or has_legacy):
+                            st.error("Forecast method requires Trend configuration, but none was found.")
+                            st.info("Go to **AI Assumptions → Configure Assumptions** and save line-item trends (Unified config).")
+                            return
+
                         ok_hist, hist_msgs = validate_historical_import_coverage(db, scenario_id, user_id=user_id, assumptions=assumptions_for_gate)
                         if not ok_hist:
                             st.error("Cannot enqueue forecast until historics import issues are resolved:")
@@ -5146,8 +5335,9 @@ Best when you have reliable historical financials and want trend-driven forecast
                         "user_id": user_id,
                         "options": {
                             "forecast_duration_months": int(st.session_state.get("forecast_periods", 60)),
-                            "forecast_method": st.session_state.get("forecast_method", None),
-                            "use_trend_forecast": bool(st.session_state.get("use_trend_forecast", False)),
+                            # Single source of truth: persisted scenario assumptions
+                            "forecast_method": assumptions_for_gate.get("forecast_method"),
+                            "use_trend_forecast": bool(assumptions_for_gate.get("use_trend_forecast", False)),
                             "run_monte_carlo": bool(include_monte_carlo),
                             "mc_iterations": int(mc_iterations),
                             "mc_fleet_cv": float(mc_fleet_cv),

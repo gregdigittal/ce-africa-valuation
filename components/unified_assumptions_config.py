@@ -81,7 +81,10 @@ class UnifiedAssumptionsConfig:
     line_items: Dict[str, LineItemConfig] = field(default_factory=dict)
     
     # Forecast method toggle
-    forecast_method: str = 'pipeline'  # 'pipeline' or 'trend'
+    # - pipeline: installed base (fleet) + prospects
+    # - trend: line-item trends drive the full forecast
+    # - hybrid: trend-driven baseline + pipeline layered on top
+    forecast_method: str = 'pipeline'  # 'pipeline' | 'hybrid' | 'trend'
     
     # Metadata
     last_updated: str = ''
@@ -182,7 +185,7 @@ def save_unified_config(db, scenario_id: str, user_id: str, config: UnifiedAssum
         
         # Also set the forecast method toggle at top level for easy access
         assumptions['forecast_method'] = config.forecast_method
-        assumptions['use_trend_forecast'] = (config.forecast_method == 'trend')
+        assumptions['use_trend_forecast'] = (config.forecast_method in ('trend', 'hybrid'))
         
         # Mark as saved in the assumptions
         assumptions['assumptions_saved'] = True
@@ -398,16 +401,23 @@ def render_unified_config_ui(db, scenario_id: str, user_id: str):
     with col1:
         method = st.radio(
             "Select Forecast Method",
-            options=['pipeline', 'trend'],
-            format_func=lambda x: '📈 Pipeline-Based (Fleet + Prospects)' if x == 'pipeline' else '📊 Trend-Based (Historical Trends)',
-            index=0 if config.forecast_method == 'pipeline' else 1,
+            options=['pipeline', 'hybrid', 'trend'],
+            format_func=lambda x: (
+                '📈 Pipeline-Based (Fleet + Prospects)' if x == 'pipeline'
+                else ('🧩 Hybrid (Trend Baseline + Pipeline Overlay)' if x == 'hybrid'
+                      else '📊 Trend-Based (Line-Item Trends)')
+            ),
+            index=0 if config.forecast_method == 'pipeline' else (1 if config.forecast_method == 'hybrid' else 2),
             key=f'forecast_method_{scenario_id}',
             help="""
 **Pipeline-Based:** Uses installed fleet revenue + prospect pipeline.
 Best when you have good fleet data and sales pipeline.
 
-**Trend-Based:** Uses historical trends to project future values.
-Best when you have reliable historical financial data.
+**Hybrid:** Uses Trend/Line-Item trends to build the baseline forecast, then adds Prospect pipeline on top.
+Best when you want historical trend shape **and** explicit pipeline opportunities.
+
+**Trend-Based:** Uses line-item trends to project future values.
+Best when you want the forecast fully driven by configured trends.
             """
         )
         config.forecast_method = method
@@ -419,6 +429,13 @@ Best when you have reliable historical financial data.
 - Revenue = Fleet Revenue + Prospect Pipeline
 - COGS = Margin-based calculation
 - OPEX = From expense assumptions
+            """)
+        elif method == 'hybrid':
+            st.info("""
+**Hybrid Forecast:**
+- Baseline = Trend/Line-item forecast
+- Plus = Prospect pipeline layered on top
+- COGS = Margin-based on total revenue (with pipeline impact)
             """)
         else:
             st.info("""

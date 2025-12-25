@@ -115,12 +115,22 @@ class SupabaseHandler:
     def update_assumptions(self, scenario_id: str, user_id: str, assumptions: Dict[str, Any]) -> bool:
         try:
             existing = self.client.table("assumptions").select("id").eq("scenario_id", scenario_id).execute()
-            payload = {"scenario_id": scenario_id, "user_id": user_id, "data": assumptions}
             if existing.data:
                 assump_id = existing.data[0]['id']
                 self.client.table("assumptions").update({"data": assumptions}).eq("id", assump_id).execute()
             else:
-                self.client.table("assumptions").insert(payload).execute()
+                # Some DBs have assumptions.user_id (RLS-ready) while others do not.
+                # Try with user_id first, then fall back gracefully.
+                payload_with_user = {"scenario_id": scenario_id, "user_id": user_id, "data": assumptions}
+                try:
+                    self.client.table("assumptions").insert(payload_with_user).execute()
+                except Exception as insert_err:
+                    msg = str(insert_err).lower()
+                    if ("user_id" in msg and "column" in msg) or ("could not find the" in msg and "user_id" in msg):
+                        payload_no_user = {"scenario_id": scenario_id, "data": assumptions}
+                        self.client.table("assumptions").insert(payload_no_user).execute()
+                    else:
+                        raise
             return True
         except Exception as e:
             st.error(f"Error saving assumptions: {e}")

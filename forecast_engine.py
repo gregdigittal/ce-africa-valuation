@@ -138,13 +138,18 @@ class ForecastEngine:
         # Calculate revenue using configured forecast methods
         # NEW: Check forecast_method toggle first (from unified config)
         forecast_method = assumptions.get('forecast_method', 'pipeline')
-        use_trend_forecast = assumptions.get('use_trend_forecast', False) or (forecast_method == 'trend')
+        use_trend_forecast = bool(assumptions.get('use_trend_forecast', False)) or (forecast_method in ('trend', 'hybrid'))
+        # Pipeline mode should ignore any stale trend flags
+        if forecast_method == 'pipeline':
+            use_trend_forecast = False
         forecast_configs = assumptions.get('forecast_configs', {})
         trend_forecast_config = assumptions.get('trend_forecasts', {})  # Legacy support
         
         # Log which method is being used
         if forecast_method == 'trend':
             _ui("info", "📊 Using **Trend-Based** forecast method")
+        elif forecast_method == 'hybrid':
+            _ui("info", "🧩 Using **Hybrid** forecast method (Trend baseline + Pipeline overlay)")
         else:
             _ui("info", "📈 Using **Pipeline-Based** forecast method (Fleet + Prospects)")
         
@@ -152,8 +157,9 @@ class ForecastEngine:
         # NEW: Line-Item Level Forecasting (Phase 2)
         # ==========================================================================
         # If we have unified_line_item_config, use the new line-item forecast engine
+        trend_baseline_total_rev: Optional[np.ndarray] = None
         unified_config = assumptions.get('unified_line_item_config')
-        if forecast_method == 'trend' and unified_config and unified_config.get('line_items'):
+        if forecast_method in ('trend', 'hybrid') and unified_config and unified_config.get('line_items'):
             try:
                 from components.line_item_forecast_engine import (
                     run_line_item_forecast,
@@ -186,19 +192,26 @@ class ForecastEngine:
                 )
                 
                 if line_item_result is not None:
-                    # Convert to legacy format and merge
-                    legacy_results = convert_to_legacy_format(line_item_result, start_date)
                     _ui("success", f"✅ Line-item forecast complete: {len(line_item_result.line_items)} items forecasted")
-                    
-                    # Update results with line-item forecast
-                    results.update(legacy_results)
-                    results['forecast_method_used'] = 'line_item'
-                    results['line_item_count'] = len(line_item_result.line_items)
-                    
-                    if progress_callback:
-                        progress_callback(1.0, "Forecast complete")
-                    
-                    return results
+
+                    if forecast_method == 'trend':
+                        # Trend-only: convert to legacy format and return (existing behavior)
+                        legacy_results = convert_to_legacy_format(line_item_result, start_date)
+                        results.update(legacy_results)
+                        results['forecast_method_used'] = 'line_item'
+                        results['line_item_count'] = len(line_item_result.line_items)
+
+                        if progress_callback:
+                            progress_callback(1.0, "Forecast complete")
+
+                        return results
+
+                    # Hybrid: use line-item total revenue as the baseline (do not return early)
+                    try:
+                        trend_baseline_total_rev = np.array(line_item_result.total_revenue, dtype=float)
+                        results['trend_baseline_source'] = 'unified_line_item_config'
+                    except Exception:
+                        trend_baseline_total_rev = None
                 else:
                     _ui("warning", "⚠️ Line-item forecast returned no results. Falling back to legacy trend method.")
             except ImportError as e:
@@ -206,9 +219,105 @@ class ForecastEngine:
             except Exception as e:
                 _ui("error", f"❌ Line-item forecast error: {e}")
                 _ui("info", "Falling back to legacy trend method.")
-        
+
+        # ======================================================================
+        # HYBRID: Trend baseline (existing) + Prospect pipeline overlay (new)
+        # ======================================================================
+        if forecast_method == 'hybrid':
+            # Pipeline overlay is always computed from prospects
+            pipeline_rev = self._calculate_pipeline_revenue(
+                data.get('prospects', []), n_months, inflation, start_date
+            )
+
+            base_fleet_rev = consumable_rev + refurb_rev
+
+            # Determine trend baseline for existing revenue
+            baseline_existing_total = None
+
+            # 1) Prefer unified line-item baseline if available
+            if trend_baseline_total_rev is not None and len(trend_baseline_total_rev) == n_months:
+                baseline_existing_total = np.maximum(trend_baseline_total_rev, 0)
+
+            # 2) Else try comprehensive forecast configs (legacy trend engine)
+            if baseline_existing_total is None and use_trend_forecast and forecast_configs and len(forecast_configs) > 0:
+                revenue_forecast = None
+                revenue_config_key = None
+
+                if 'revenue' in forecast_configs:
+                    revenue_config_key = 'revenue'
+                elif 'total_revenue' in forecast_configs:
+                    revenue_config_key = 'total_revenue'
+
+                if revenue_config_key:
+                    revenue_forecast = self._generate_forecast_from_config(
+                        revenue_config_key,
+                        forecast_configs,
+                        data,
+                        n_months,
+                        start_date
+                    )
+
+                if revenue_forecast is not None and len(revenue_forecast) == n_months:
+                    baseline_existing_total = np.maximum(revenue_forecast, 0)
+                else:
+                    _ui("warning", "⚠️ Hybrid selected but no valid revenue trend forecast found in forecast_configs. Falling back to fleet baseline.")
+
+            # 3) Else try legacy trend_forecasts (Trend Forecast tab)
+            if baseline_existing_total is None and use_trend_forecast and isinstance(trend_forecast_config, dict) and ('revenue' in trend_forecast_config):
+                try:
+                    from components.trend_forecast_analyzer import TrendForecastAnalyzer, TrendFunction
+
+                    trend_config = trend_forecast_config['revenue']
+                    analyzer = TrendForecastAnalyzer()
+
+                    historical_revenue = data.get('historical_revenue', pd.Series())
+                    if historical_revenue.empty:
+                        hist_financials = data.get('historic_financials', pd.DataFrame())
+                        if not hist_financials.empty and 'revenue' in hist_financials.columns:
+                            if 'month' in hist_financials.columns:
+                                historical_revenue = hist_financials.set_index('month')['revenue'].sort_index()
+                            else:
+                                historical_revenue = hist_financials['revenue']
+
+                    if not historical_revenue.empty:
+                        function_type = TrendFunction(trend_config.get('function_type', 'linear'))
+                        trend_params = trend_config.get('parameters', {})
+                        trend_revenue = analyzer.generate_forecast_with_params(
+                            historical_revenue,
+                            function_type,
+                            trend_params,
+                            n_months
+                        )
+                        if len(trend_revenue) == n_months:
+                            baseline_existing_total = np.maximum(np.array(trend_revenue, dtype=float), 0)
+                except Exception:
+                    baseline_existing_total = None
+
+            # 4) Final fallback: fleet baseline (hybrid degrades gracefully to pipeline)
+            if baseline_existing_total is None:
+                baseline_existing_total = base_fleet_rev.copy()
+
+            # Ensure we never go below the fleet baseline (installed base model floor)
+            baseline_existing_total = np.maximum(baseline_existing_total, base_fleet_rev)
+
+            # Allocate any uplift above fleet baseline back into consumables/refurb to preserve margins logic
+            uplift = baseline_existing_total - base_fleet_rev
+            if np.any(uplift > 0):
+                # Default split when fleet baseline is zero for a month
+                default_cons_share = 0.70
+                default_ref_share = 0.30
+
+                denom = np.where(base_fleet_rev > 0, base_fleet_rev, 1.0)
+                cons_share = np.where(base_fleet_rev > 0, consumable_rev / denom, default_cons_share)
+                ref_share = np.where(base_fleet_rev > 0, refurb_rev / denom, default_ref_share)
+
+                consumable_rev = consumable_rev + uplift * cons_share
+                refurb_rev = refurb_rev + uplift * ref_share
+
+            total_rev = consumable_rev + refurb_rev + pipeline_rev
+
         # Use comprehensive forecast configs if available (only if trend method selected)
-        if use_trend_forecast and forecast_configs and len(forecast_configs) > 0:
+        elif forecast_method == 'trend' and use_trend_forecast and forecast_configs and len(forecast_configs) > 0:
             if progress_callback:
                 progress_callback(0.5, f"Applying configured forecast methods ({len(forecast_configs)} elements)...")
             
@@ -295,7 +404,7 @@ The forecast cannot continue without valid trend parameters when trend-based for
                 return results
         
         # Legacy: Use simple trend forecast if no comprehensive config
-        elif use_trend_forecast and 'revenue' in trend_forecast_config:
+        elif forecast_method == 'trend' and use_trend_forecast and 'revenue' in trend_forecast_config:
             # Use trend-based forecast for revenue
             if progress_callback:
                 progress_callback(0.5, "Applying trend-based revenue forecast...")
@@ -679,9 +788,12 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
             )
             from components.trend_forecast_analyzer import TrendForecastAnalyzer, TrendFunction
             
-            # Get historical data
-            historical_data = data.get('historic_financials', pd.DataFrame())
-            if historical_data.empty:
+            # Get historical data (support both keys for compatibility)
+            historical_data = data.get('historic_financials', None)
+            if historical_data is None or (isinstance(historical_data, pd.DataFrame) and historical_data.empty):
+                historical_data = data.get('historical_financials', pd.DataFrame())
+
+            if isinstance(historical_data, pd.DataFrame) and historical_data.empty:
                 _ui("error", f"❌ No historical data found for {element_name}. Available data keys: {list(data.keys())}")
                 return None
             
