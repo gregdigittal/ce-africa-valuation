@@ -322,3 +322,75 @@ def load_forecast_data_api(
 
     return data
 
+
+def get_historics_diagnostics_api(db, scenario_id: str, user_id: str) -> Dict[str, Any]:
+    """
+    Diagnostics helper for thin-client debugging.
+    Returns expected vs found period coverage + monthly IS bucket totals (post-upsampling if annual/YTD-only).
+    """
+    assumptions: Dict[str, Any] = {}
+    try:
+        if hasattr(db, "get_scenario_assumptions"):
+            assumptions = db.get_scenario_assumptions(scenario_id, user_id) or {}
+    except Exception:
+        assumptions = {}
+
+    ip = (assumptions or {}).get("import_period_settings") or {}
+    expected = []
+    try:
+        blk = (ip.get("historical_income_statement_line_items") or {}) if isinstance(ip, dict) else {}
+        sel = blk.get("selected_periods") or []
+        if isinstance(sel, list):
+            expected = [str(x).strip() for x in sel if str(x).strip()]
+    except Exception:
+        expected = []
+
+    hist_df, diag = load_income_statement_history(db, scenario_id)
+    used_sales_pattern = False
+    try:
+        fy_end_month = 12
+        ytd_overrides: Dict[int, Dict[str, Any]] = {}
+        if isinstance(ip, dict):
+            blk = ip.get("historical_income_statement_line_items") or {}
+            fy_end_month = int(blk.get("fiscal_year_end_month") or fy_end_month)
+            ytd_cfg = blk.get("ytd") or None
+            if isinstance(ytd_cfg, dict) and ytd_cfg.get("year"):
+                ytd_overrides[int(ytd_cfg["year"])] = {
+                    "year_end_month": int(ytd_cfg.get("year_end_month") or fy_end_month),
+                    "ytd_end_calendar_month": int(ytd_cfg.get("ytd_end_calendar_month") or 0) or None,
+                }
+        pattern = _get_monthly_sales_pattern_api(db, scenario_id)
+        used_sales_pattern = bool(pattern is not None)
+        hist_df = _upsample_annual_or_ytd_is(hist_df, pattern, fiscal_year_end_month=fy_end_month, ytd_overrides=ytd_overrides)
+    except Exception:
+        pass
+
+    found = []
+    monthly = []
+    if not hist_df.empty and "period_date" in hist_df.columns:
+        _p = pd.to_datetime(hist_df["period_date"], errors="coerce").dt.to_period("M").astype(str)
+        found = sorted(set([x for x in _p.dropna().tolist() if isinstance(x, str) and x.strip()]))
+
+        view = hist_df.copy()
+        view["period"] = pd.to_datetime(view["period_date"], errors="coerce").dt.to_period("M").astype(str)
+        keep_cols = [c for c in ["period", "revenue", "cogs", "opex", "depreciation", "interest", "tax", "other_income", "gross_profit", "ebit"] if c in view.columns]
+        view = view[keep_cols].copy()
+        for c in keep_cols:
+            if c != "period":
+                view[c] = pd.to_numeric(view[c], errors="coerce").fillna(0.0)
+        monthly = view.sort_values("period").to_dict(orient="records")
+
+    missing = sorted(set(expected) - set(found)) if expected else []
+    extra = sorted(set(found) - set(expected)) if expected else []
+
+    return {
+        "scenario_id": scenario_id,
+        "expected_periods_is": expected,
+        "found_periods_is": found,
+        "missing_periods_is": missing,
+        "extra_periods_is": extra,
+        "income_statement_monthly": monthly,
+        "used_sales_pattern": used_sales_pattern,
+        "source_diag": diag,
+    }
+

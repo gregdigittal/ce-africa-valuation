@@ -4886,6 +4886,15 @@ Best when you have reliable historical financials and want trend-driven forecast
                     else:
                         st.write("- YTD: **No**")
                     st.markdown("---")
+
+                # Optional: fetch API-side diagnostics (thin-client debugging)
+                try:
+                    if exec_mode == "API (background)":
+                        if st.button("Fetch historics diagnostics (API)", use_container_width=True, key="fetch_hist_diag_api"):
+                            diag_url = urljoin(api_base_url, f"v1/scenarios/{scenario_id}/historics/diagnostics?user_id={user_id}")
+                            st.json(_http_json("GET", diag_url, payload=None, timeout=30))
+                except Exception:
+                    pass
     except Exception:
         pass
     

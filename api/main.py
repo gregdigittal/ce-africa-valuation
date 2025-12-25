@@ -9,6 +9,7 @@ from api.queue import get_queue
 from api.supabase_handler import SupabaseAPIHandler
 from api.tasks import run_forecast_task
 from api.validation import validate_import_coverage
+from api.forecast_data import get_historics_diagnostics_api
 
 
 app = FastAPI(title="CE Africa Valuation API", version="0.1.0")
@@ -129,4 +130,35 @@ def get_snapshot(
     if not snap:
         raise HTTPException(status_code=404, detail="Snapshot not found")
     return snap
+
+
+@app.get("/v1/scenarios/{scenario_id}/historics/diagnostics")
+def historics_diagnostics(
+    scenario_id: str,
+    request: Request,
+    user_id: str | None = Query(None, description="User UUID (fallback when no Authorization header)"),
+):
+    effective_user_id = user_id
+    try:
+        token = parse_bearer_token(request.headers.get("Authorization"))
+        if token:
+            effective_user_id = verify_supabase_jwt(token).user_id
+    except Exception:
+        if request.headers.get("Authorization"):
+            raise HTTPException(status_code=401, detail="Invalid Authorization token")
+
+    if not effective_user_id:
+        raise HTTPException(status_code=401, detail="Missing user_id (provide Authorization header or user_id query param)")
+
+    db = SupabaseAPIHandler()
+    try:
+        owner = db.get_scenario_user_id(scenario_id)
+        if owner and str(owner) != str(effective_user_id):
+            raise HTTPException(status_code=403, detail="Scenario not accessible for this user")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    return get_historics_diagnostics_api(db, scenario_id=scenario_id, user_id=str(effective_user_id))
 
