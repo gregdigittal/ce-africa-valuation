@@ -18,6 +18,8 @@ venv/
 # Local data imports (do not commit)
 CE Imports/
 Historic Sales/
+CE Africa AFS Extracts/
+CE Data Extracts/
 
 # Legacy/backup codebases (do not commit)
 .backups/
