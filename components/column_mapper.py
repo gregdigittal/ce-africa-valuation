@@ -208,17 +208,9 @@ def transform_wide_to_long(df: pd.DataFrame, import_type: str) -> pd.DataFrame:
             if pd.isna(value) or value == '' or str(value).strip() == '':
                 continue
             
-            # Parse value (handle accounting format with parentheses)
-            try:
-                if isinstance(value, str):
-                    value_str = value.strip()
-                    if value_str.startswith('(') and value_str.endswith(')'):
-                        amount = -float(value_str.strip('()').replace(',', ''))
-                    else:
-                        amount = float(value_str.replace(',', ''))
-                else:
-                    amount = float(value)
-            except:
+            # Parse value using shared parser (currency codes, separators, parentheses, trailing minus, etc.)
+            amount = parse_number(value, default=float("nan"))
+            if pd.isna(amount):
                 continue
             
             # Create long format row
@@ -1339,46 +1331,103 @@ def parse_date(value, default=None) -> Optional[str]:
 
 
 def parse_number(value, default=0) -> float:
-    """Parse a numeric value, handling currency formatting and accounting parentheses."""
+    """
+    Parse a numeric value from common finance/accounting formats.
+
+    Handles:
+    - Currency symbols/codes: R, ZAR, $, €, £, USD, etc.
+    - Thousands separators: commas, dots, spaces (incl NBSP)
+    - Decimal separators: "." or ","
+    - Accounting negatives: (123), R(123), $(1,234.56)
+    - Trailing minus: 123-
+    - Optional CR/DR suffixes (stripped)
+    """
     if pd.isna(value):
         return default
+
+    # Fast-path for real numeric types (but avoid booleans)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return float(value)
+        except Exception:
+            return default
+
     try:
-        # Convert to string and clean
-        cleaned = str(value).strip()
+        s = str(value).strip()
 
         # Strip common quoting
-        if (cleaned.startswith('"') and cleaned.endswith('"')) or (cleaned.startswith("'") and cleaned.endswith("'")):
-            cleaned = cleaned[1:-1].strip()
-        cleaned = cleaned.strip()
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            s = s[1:-1].strip()
+
+        # Normalize whitespace (incl NBSP/narrow NBSP) and remove all whitespace chars
+        s = s.replace("\u00A0", "").replace("\u202F", "")
+        s = re.sub(r"\s+", "", s)
 
         # Handle placeholders
-        if cleaned in ("", "-", "–", "—", "N/A", "na", "NaN", "nan"):
+        if s == "":
             return default
-        
-        # Handle accounting format: (12345) means -12345
-        # Some files include spaces inside parentheses: "( 123 )"
-        cleaned_no_space = cleaned.replace(" ", "")
-        is_negative = cleaned_no_space.startswith('(') and cleaned_no_space.endswith(')')
-        if is_negative:
-            cleaned = cleaned_no_space[1:-1]  # Remove parentheses
-        else:
-            cleaned = cleaned_no_space
-        
-        # Remove common currency formatting
-        cleaned = cleaned.replace(',', '').replace('R', '').replace('$', '').replace('€', '').replace('£', '')
-        
-        # After cleanup, still empty/placeholder
-        if cleaned in ("", "-", "–", "—"):
+        if s.lower() in ("-", "–", "—", "n/a", "na", "nan", "null", "none"):
             return default
 
-        result = float(cleaned)
-        
-        # Apply negative if it was in parentheses
-        if is_negative:
+        neg = False
+
+        # Handle trailing minus (e.g., "123-" or "1,234.56-")
+        if s.endswith("-") and len(s) > 1:
+            neg = True
+            s = s[:-1]
+
+        # Strip common CR/DR suffixes (do not flip sign; column semantics decide)
+        s = re.sub(r"(?i)(cr|dr)$", "", s)
+
+        # Handle accounting parentheses for negatives, including prefix currency codes: "R(123)", "$(1,234)"
+        #  - "(123)" OR "R(123)" OR "USD(123.45)"
+        m = re.match(r"^[^\d\-\+]*\((.+)\)$", s)
+        if m:
+            neg = True
+            s = m.group(1)
+
+        # Leading sign
+        if s.startswith("+"):
+            s = s[1:]
+        elif s.startswith("-"):
+            neg = True
+            s = s[1:]
+
+        # Remove any remaining non-numeric characters except separators
+        # (currency codes, apostrophes, etc.)
+        s = re.sub(r"[^0-9\.,]", "", s)
+
+        if s == "" or s in (".", ","):
+            return default
+
+        # Normalize separators to a float-friendly representation
+        if "." in s and "," in s:
+            # Decimal separator is typically the rightmost of the two
+            if s.rfind(",") > s.rfind("."):
+                # e.g. "1.234.567,89" -> "1234567.89"
+                s = s.replace(".", "")
+                s = s.replace(",", ".")
+            else:
+                # e.g. "1,234,567.89" -> "1234567.89"
+                s = s.replace(",", "")
+        else:
+            # Only one of "." or "," exists (or neither)
+            if "," in s and "." not in s:
+                # If it matches a thousands pattern, remove commas; else treat comma as decimal
+                if re.match(r"^\d{1,3}(,\d{3})+$", s):
+                    s = s.replace(",", "")
+                else:
+                    s = s.replace(",", ".")
+            elif "." in s and "," not in s:
+                # If it matches a thousands pattern, remove dots; else keep dot as decimal
+                if re.match(r"^\d{1,3}(\.\d{3})+$", s):
+                    s = s.replace(".", "")
+
+        result = float(s)
+        if neg:
             result = -result
-        
         return result
-    except:
+    except Exception:
         return default
 
 
@@ -2190,6 +2239,164 @@ def render_import_with_mapping(
     
     st.markdown(f"### {config['icon']} Import {config['display_name']}")
     st.caption(config['description'])
+
+    # -------------------------------------------------------------------------
+    # Post-import DB verification (shows after successful import + rerun)
+    # -------------------------------------------------------------------------
+    def _normalize_period_labels(period_dates: pd.Series) -> List[str]:
+        try:
+            _dt = pd.to_datetime(period_dates, errors="coerce").dt.to_period("M").astype(str)
+            return sorted(set([x for x in _dt.dropna().tolist() if isinstance(x, str) and x.strip()]))
+        except Exception:
+            return []
+
+    def _query_line_items_for_periods(table: str, expected_labels: List[str]) -> pd.DataFrame:
+        # Convert YYYY-MM labels to month starts for filtering
+        month_starts = []
+        for lbl in expected_labels or []:
+            try:
+                if re.match(r"^\d{4}-\d{2}$", str(lbl)):
+                    month_starts.append(f"{lbl}-01")
+            except Exception:
+                pass
+        month_starts = sorted(set(month_starts))
+
+        cols = "period_date,amount,category,line_item_name,statement_type"
+        base = db.client.table(table).select(cols).eq("scenario_id", scenario_id)
+        if month_starts:
+            base = base.in_("period_date", month_starts)
+
+        # Prefer user_id filter when available, but fall back if schema/RLS differs
+        try:
+            resp = base.eq("user_id", user_id).execute()
+        except Exception:
+            resp = base.execute()
+        return pd.DataFrame(resp.data) if getattr(resp, "data", None) else pd.DataFrame()
+
+    def _summarize_db_line_items(df: pd.DataFrame, kind: str) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame()
+        work = df.copy()
+        work["period_date"] = pd.to_datetime(work.get("period_date"), errors="coerce").dt.to_period("M").dt.to_timestamp()
+        work["amount"] = pd.to_numeric(work.get("amount"), errors="coerce").fillna(0.0)
+        work["category_norm"] = work.get("category", "").fillna("").astype(str).str.lower()
+        work["line_item_norm"] = work.get("line_item_name", "").fillna("").astype(str).str.lower()
+
+        if kind == "income_statement":
+            is_revenue = work["category_norm"].str.contains("revenue|sales|income|turnover", na=False) | work["line_item_norm"].str.contains("revenue|sales|income|turnover", na=False)
+            is_cogs = work["category_norm"].str.contains("cost of sales|cogs|cost of goods|purchases|direct cost", na=False) | work["line_item_norm"].str.contains("cogs|cost of sales|direct cost", na=False)
+            is_opex = work["category_norm"].str.contains("opex|operating expense|operating expenses|expense|expenses|overhead|admin|administration|distribution|selling|marketing", na=False) | work["line_item_norm"].str.contains("opex|operating expense|overhead|admin", na=False)
+            out = (
+                work.groupby("period_date")
+                .apply(
+                    lambda g: pd.Series(
+                        {
+                            "revenue": float(g.loc[is_revenue.reindex(g.index, fill_value=False), "amount"].sum()),
+                            "cogs": float(g.loc[is_cogs.reindex(g.index, fill_value=False), "amount"].sum()),
+                            "opex": float(g.loc[is_opex.reindex(g.index, fill_value=False), "amount"].sum()),
+                        }
+                    )
+                )
+                .reset_index()
+                .sort_values("period_date")
+            )
+            out["gross_profit"] = out["revenue"] - out["cogs"]
+            out["ebit_approx"] = out["gross_profit"] - out["opex"]
+            return out
+
+        if kind == "balance_sheet":
+            is_assets = work["category_norm"].str.contains("asset", na=False) | work["line_item_norm"].str.contains("asset", na=False)
+            is_liab = work["category_norm"].str.contains("liabil|payable|debt", na=False) | work["line_item_norm"].str.contains("liabil|payable|debt", na=False)
+            is_eq = work["category_norm"].str.contains("equity|retained|share capital", na=False) | work["line_item_norm"].str.contains("equity|retained|share", na=False)
+            out = (
+                work.groupby("period_date")
+                .apply(
+                    lambda g: pd.Series(
+                        {
+                            "assets": float(g.loc[is_assets.reindex(g.index, fill_value=False), "amount"].sum()),
+                            "liabilities": float(g.loc[is_liab.reindex(g.index, fill_value=False), "amount"].sum()),
+                            "equity": float(g.loc[is_eq.reindex(g.index, fill_value=False), "amount"].sum()),
+                        }
+                    )
+                )
+                .reset_index()
+                .sort_values("period_date")
+            )
+            out["balance_check"] = out["assets"] - (out["liabilities"] + out["equity"])
+            return out
+
+        if kind == "cash_flow":
+            is_op = work["category_norm"].str.contains("operating|operations|cfo", na=False) | work["line_item_norm"].str.contains("operating|operations|cfo", na=False)
+            is_inv = work["category_norm"].str.contains("investing|cfi|capex|capital", na=False) | work["line_item_norm"].str.contains("investing|capex|capital", na=False)
+            is_fin = work["category_norm"].str.contains("financing|cff|debt|equity|dividend", na=False) | work["line_item_norm"].str.contains("financing|debt|equity|dividend", na=False)
+            out = (
+                work.groupby("period_date")
+                .apply(
+                    lambda g: pd.Series(
+                        {
+                            "operating": float(g.loc[is_op.reindex(g.index, fill_value=False), "amount"].sum()),
+                            "investing": float(g.loc[is_inv.reindex(g.index, fill_value=False), "amount"].sum()),
+                            "financing": float(g.loc[is_fin.reindex(g.index, fill_value=False), "amount"].sum()),
+                        }
+                    )
+                )
+                .reset_index()
+                .sort_values("period_date")
+            )
+            out["net_cash_flow"] = out["operating"] + out["investing"] + out["financing"]
+            return out
+
+        return pd.DataFrame()
+
+    post_key = f"post_import_{import_type}_{scenario_id or 'no_scenario'}"
+    post = st.session_state.get(post_key)
+    if isinstance(post, dict) and post.get("scenario_id") == scenario_id and post.get("user_id") == user_id:
+        if import_type in [
+            "historical_income_statement_line_items",
+            "historical_balance_sheet_line_items",
+            "historical_cashflow_line_items",
+        ]:
+            with st.expander("✅ Post-import DB verification (last import)", expanded=True):
+                st.caption("Verifies what actually landed in Supabase (row/period counts + monthly bucket totals).")
+                st.write(
+                    f"- Imported rows (reported): **{post.get('stats', {}).get('success', 0)}**"
+                    f" (skipped: {post.get('stats', {}).get('skipped', 0)})"
+                )
+                expected = post.get("expected_periods") or []
+                if expected:
+                    st.write(f"- Expected periods (from selection/mapped file): **{len(expected)}**")
+
+                kind = {
+                    "historical_income_statement_line_items": "income_statement",
+                    "historical_balance_sheet_line_items": "balance_sheet",
+                    "historical_cashflow_line_items": "cash_flow",
+                }.get(import_type)
+
+                run_verify = st.button("Run DB verification now", key=f"{post_key}_run_verify")
+                if run_verify:
+                    try:
+                        db_df = _query_line_items_for_periods(config.get("table"), expected)
+                        st.write(f"Rows found in DB (filtered): **{len(db_df)}**")
+                        if "period_date" in db_df.columns:
+                            db_periods = _normalize_period_labels(db_df["period_date"])
+                            st.write(f"Distinct periods in DB: **{len(db_periods)}**")
+                            if expected:
+                                missing = sorted(set(expected) - set(db_periods))
+                                extra = sorted(set(db_periods) - set(expected))
+                                if missing:
+                                    st.warning("Missing periods in DB: " + ", ".join(missing[:12]) + (" ..." if len(missing) > 12 else ""))
+                                if extra:
+                                    st.info("Additional periods in DB (not expected): " + ", ".join(extra[:12]) + (" ..." if len(extra) > 12 else ""))
+
+                        summary = _summarize_db_line_items(db_df, kind or "")
+                        if not summary.empty:
+                            view = summary.copy()
+                            view["period_date"] = view["period_date"].dt.strftime("%Y-%m")
+                            st.dataframe(view, hide_index=True, use_container_width=True)
+                        else:
+                            st.info("No summary could be generated (no rows or missing columns).")
+                    except Exception as e:
+                        st.error(f"DB verification failed: {str(e)[:200]}")
     
     # Check scenario requirement
     if config['requires_scenario'] and not scenario_id:
@@ -2518,6 +2725,20 @@ def render_import_with_mapping(
                         _parsed_amt = mapped_df["amount"].apply(lambda v: parse_number(v, default=float("nan")))
                         bad_amt = int(pd.isna(_parsed_amt).sum())
                         diag_rows.append({"check": "unparseable amount", "value": bad_amt})
+                        if bad_amt > 0:
+                            try:
+                                bad_raw = (
+                                    mapped_df.loc[pd.isna(_parsed_amt), "amount"]
+                                    .astype(str)
+                                    .str.strip()
+                                    .replace({"nan": "", "NaN": ""})
+                                )
+                                top_bad = bad_raw.value_counts(dropna=False).head(15).reset_index()
+                                top_bad.columns = ["raw_amount_value", "count"]
+                                st.caption("Most common unparseable `amount` values (raw):")
+                                st.dataframe(top_bad, hide_index=True, use_container_width=True)
+                            except Exception:
+                                pass
                     
                     # Statement type guess (best-effort) to catch "wrong tab / wrong statement" uploads
                     if "category" in mapped_df.columns:
@@ -2735,6 +2956,25 @@ def render_import_with_mapping(
 
                 if on_success:
                     on_success()
+
+                # Persist a "last import" marker so we can run post-write DB verification after rerun
+                try:
+                    expected_periods = []
+                    if import_settings and import_settings.get("selected_periods"):
+                        expected_periods = list(import_settings.get("selected_periods") or [])
+                    elif isinstance(mapped_df, pd.DataFrame) and "period_date" in mapped_df.columns:
+                        expected_periods = _normalize_period_labels(mapped_df["period_date"])
+                    st.session_state[post_key] = {
+                        "import_type": import_type,
+                        "table": config.get("table"),
+                        "scenario_id": scenario_id,
+                        "user_id": user_id,
+                        "expected_periods": expected_periods,
+                        "stats": dict(stats or {}),
+                        "at": datetime.utcnow().isoformat(),
+                    }
+                except Exception:
+                    pass
 
                 # Only rerun on success - errors will stop() to keep them visible
                 st.rerun()
