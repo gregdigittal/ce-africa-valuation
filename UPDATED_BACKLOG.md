@@ -19,6 +19,71 @@
 
 ---
 
+## 📌 Online Version Backlog Additions (Dec 25, 2025)
+
+### A) Local fixes that must be ported to Online ✅➡️🌐
+
+1. **Historics import amount parsing hardening**
+   - Improve numeric parsing for accounting/currency formats (parentheses negatives, trailing minus, NBSP/thousands separators, decimal comma).
+   - Add preflight diagnostics listing most common raw `amount` strings that fail parsing.
+
+2. **Setup → Historics crash fix**
+   - Fix `'bool' object has no attribute 'any'` caused by calling `.any()` on a scalar default when the `revenue` bucket/column is missing.
+
+3. **Income Statement (historical) revenue classification + display**
+   - Treat Installed Base revenue labels (e.g., **Existing Customers / Prospective Customers** + **Wear Parts / Refurbishment & Service**) as revenue even when category does not contain “Revenue”.
+   - Add “Latest vs Earliest” period window selector in Financial Statements so forecast periods are not hidden by default.
+
+4. **RLS-aware historical loaders**
+   - Ensure detailed line-item aggregation + historical loaders use `user_id` where needed and cache keys include `user_id`.
+
+---
+
+### B) New feature: Sales Orders import + Wear vs Refurb revenue split (Online) 🚀
+
+**Problem:** Historic Income Statement imports often provide only a single Revenue line (no split into Wear Parts vs Refurbishment/Service).  
+**Goal:** Use historic sales orders to infer the split and apply it consistently to historical actuals and forecasting.
+
+**Work items:**
+
+1. **Database**
+   - Add `sales_orders` table + RLS + indexes (see `migrations_add_sales_orders.sql`).
+
+2. **Import UX (Streamlit)**
+   - Add **Sales Orders (Historical)** import to Setup Wizard → Historics.
+   - Use `st.data_editor` for preview + `column_mapper` for flexible mapping.
+   - Persist import settings (period selections, file metadata) into assumptions JSONB under `import_period_settings` (consistent with existing historics flow).
+
+3. **Classification + split engine (AI-assisted, with deterministic fallback)**
+   - Classify each sales order line into:
+     - Wear Parts (consumables)
+     - Refurbishment/Service
+     - Other/Unknown
+   - Compute monthly split ratios (wear vs refurb) and confidence diagnostics.
+   - Store results in assumptions JSONB:
+     - `historical_revenue_split`: per-month ratios + totals + method + confidence + timestamp.
+
+4. **Apply split**
+   - When historical Income Statement has only total revenue, apportion into:
+     - `rev_wear_existing` / `rev_service_existing` (and optionally prospect split if available)
+   - Use the split to calibrate:
+     - Revenue mix assumptions
+     - Margin mix (wear vs refurb)
+     - Forecast revenue detail breakdown
+
+5. **Validation**
+   - Add an integrity check that compares:
+     - Total revenue from IS actuals vs total revenue aggregated from sales orders (within tolerance, after VAT/discount handling rules are defined).
+
+---
+
+### C) AI Assumptions section refactor (Online) 🧠🧹
+
+**Problem:** AI Assumptions UX is currently complex and unclear about what is required vs optional, with multiple overlapping save paths and legacy tabs.  
+**Goal:** Single, obvious workflow with one “Applied Assumptions” view + consistent forecast gating.
+
+- Refactor recommendation doc: `docs/AI_ASSUMPTIONS_REFACTOR_RECOMMENDATION.md`
+
 ## ✅ Recently Completed (December 16, 2025 - Evening)
 
 ### Critical Bug Fixes ✅

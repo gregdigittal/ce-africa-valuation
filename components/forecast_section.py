@@ -595,18 +595,19 @@ def load_historical_expense_categories(db, scenario_id: str) -> pd.DataFrame:
     return df
 
 
-def load_historical_financials(db, scenario_id: str) -> pd.DataFrame:
+def load_historical_financials(db, scenario_id: str, user_id: Optional[str] = None) -> pd.DataFrame:
     """
     Load historical financial data using detailed line items (income statement).
     Aggregates detailed line items to summary format, upsamples annual/YTD to monthly
     using monthly sales pattern when available, and caches the result.
     """
-    cache_key = f'historical_financials_{scenario_id}'
+    # Include user_id in cache key because detailed line item tables are RLS-scoped
+    cache_key = f'historical_financials_{scenario_id}_{user_id or "all"}'
     if cache_key in st.session_state:
         return st.session_state[cache_key]
     
     # Aggregate from detailed line items (may be annual/YTD)
-    aggregated_df = aggregate_detailed_line_items_to_summary(db, scenario_id)
+    aggregated_df = aggregate_detailed_line_items_to_summary(db, scenario_id, user_id)
     # Fallback: if no revenue/COGS found in detailed, try legacy summary table (historic_financials)
     try:
         needs_summary_fallback = aggregated_df.empty
@@ -617,7 +618,16 @@ def load_historical_financials(db, scenario_id: str) -> pd.DataFrame:
             cogs_sum = aggregated_df[cogs_cols].sum().sum() if cogs_cols else 0
             needs_summary_fallback = (rev_sum == 0 and cogs_sum == 0)
         if needs_summary_fallback and hasattr(db, 'client'):
-            resp = db.client.table('historic_financials').select('*').eq('scenario_id', scenario_id).order('month').execute()
+            base = db.client.table('historic_financials').select('*').eq('scenario_id', scenario_id)
+            resp = None
+            # Prefer user_id filter when available (RLS-friendly), then fall back to scenario-only
+            if user_id:
+                try:
+                    resp = base.eq('user_id', user_id).order('month').execute()
+                except Exception:
+                    resp = None
+            if resp is None or not getattr(resp, 'data', None):
+                resp = base.order('month').execute()
             if resp.data:
                 summary_df = pd.DataFrame(resp.data)
                 if 'month' in summary_df.columns:
@@ -785,7 +795,7 @@ def validate_historical_import_coverage(
             return True
         q = (
             db.client.table(table)
-            .select("period_date,category,line_item_name,amount")
+            .select("period_date,category,sub_category,line_item_name,amount")
             .eq("scenario_id", scenario_id)
             .in_("period_date", month_starts)
         )
@@ -811,9 +821,22 @@ def validate_historical_import_coverage(
         if df.empty:
             return False
         df["category"] = df.get("category", "").fillna("").astype(str).str.lower()
+        df["sub_category"] = df.get("sub_category", "").fillna("").astype(str).str.lower()
         df["line_item_name"] = df.get("line_item_name", "").fillna("").astype(str).str.lower()
         df["amount"] = pd.to_numeric(df.get("amount"), errors="coerce").fillna(0.0)
-        is_rev = df["category"].str.contains("revenue|sales|income|turnover", na=False) | df["line_item_name"].str.contains("revenue|sales|income|turnover", na=False)
+
+        text = (df["category"] + " " + df["sub_category"] + " " + df["line_item_name"]).str.strip()
+        expense_markers = (
+            "cogs|cost of|expense|opex|operating expense|overhead|admin|administration|"
+            "depreciation|amort|tax|interest|finance cost"
+        )
+        rev_markers = "revenue|sales|turnover|existing customer|prospective customer|installed base"
+        item_markers = "wear part|wear parts|wearparts|liner|liners|consumable|refurb|refurbishment|service"
+
+        is_rev = text.str.contains(rev_markers, na=False) | (
+            text.str.contains(item_markers, na=False) & ~text.str.contains(expense_markers, na=False)
+        )
+
         return float(df.loc[is_rev, "amount"].sum()) != 0.0
 
     checks = [
@@ -1250,8 +1273,14 @@ def load_forecast_data(db, scenario_id: str, user_id: str = None, force_refresh:
     cache_key = f'forecast_data_{scenario_id}'
     if not force_refresh and cache_key in st.session_state:
         cached = st.session_state[cache_key]
-        # If cached has no machines, fall through to reload
+        # If cached has machines, keep the heavy parts cached but refresh historicals.
+        # Imports often change historicals; this prevents stale/zero historical views after re-imports.
         if cached.get('machines'):
+            try:
+                cached['historical_financials'] = load_historical_financials(db, scenario_id, user_id)
+                st.session_state[cache_key] = cached
+            except Exception:
+                pass
             return cached
     
     data = {
@@ -1282,7 +1311,7 @@ def load_forecast_data(db, scenario_id: str, user_id: str = None, force_refresh:
                     data['ai_assumptions'] = None
         
         # Load historical financials (uses its own cache)
-        data['historical_financials'] = load_historical_financials(db, scenario_id)
+        data['historical_financials'] = load_historical_financials(db, scenario_id, user_id)
         
         # Try machine_instances first (new schema from Sprint 2)
         try:
@@ -4146,7 +4175,8 @@ def render_income_statement_table(
     data: pd.DataFrame,
     show_revenue_detail: bool = True,
     show_opex_detail: bool = True,
-    view_mode: str = 'monthly'
+    view_mode: str = 'monthly',
+    period_window: str = "latest",
 ):
     """Render the income statement as a formatted HTML table."""
     
@@ -4159,8 +4189,12 @@ def render_income_statement_table(
     max_cols = 8 if view_mode == 'annual' else 12
     
     if len(periods) > max_cols:
-        periods = periods[:max_cols]
-        st.caption(f"📊 Showing first {max_cols} periods. Export for complete data.")
+        if str(period_window).lower().startswith("ear"):
+            periods = periods[:max_cols]
+            st.caption(f"📊 Showing earliest {max_cols} periods. Export for complete data.")
+        else:
+            periods = periods[-max_cols:]
+            st.caption(f"📊 Showing latest {max_cols} periods. Export for complete data.")
     
     display_data = data[data['period_label'].isin(periods)]
     
@@ -4539,27 +4573,114 @@ def _merge_detailed_line_items_into_monthly_data(
                             if pd.isna(current_val) or current_val == 0:
                                 monthly_data.loc[idx, column_name] = amount
                 
-                # Aggregate revenue line items if available
-                revenue_items = period_df[
-                    period_df['category'].str.contains('Revenue', case=False, na=False)
-                ]
-                
-                if not revenue_items.empty:
-                    for line_item_name, item_group in revenue_items.groupby('line_item_name'):
-                        amount = item_group['amount'].sum()
-                        # Revenue should be positive
-                        amount = abs(amount) if amount < 0 else amount
-                        
-                        column_name = None
-                        for key, col in line_item_mapping.items():
-                            if key.lower() in line_item_name.lower():
-                                column_name = col
-                                break
-                        
-                        if column_name and column_name in monthly_data.columns:
-                            current_val = monthly_data.loc[idx, column_name]
-                            if pd.isna(current_val) or current_val == 0:
-                                monthly_data.loc[idx, column_name] = amount
+                # -----------------------------------------------------------------
+                # Revenue line items (Installed Base model)
+                # -----------------------------------------------------------------
+                # Historical uploads often use:
+                # - category/sub_category like "Existing Customers" / "Prospective Customers"
+                # - line items like "Wear Parts" / "Refurbishment & Service"
+                # and may NOT include a literal "Revenue" category on each row.
+                try:
+                    rev_df = period_df.copy()
+                    rev_df["category"] = rev_df.get("category", "").fillna("").astype(str)
+                    rev_df["sub_category"] = rev_df.get("sub_category", "").fillna("").astype(str)
+                    rev_df["line_item_name"] = rev_df.get("line_item_name", "").fillna("").astype(str)
+                    rev_df["_cat"] = rev_df["category"].str.lower()
+                    rev_df["_sub"] = rev_df["sub_category"].str.lower()
+                    rev_df["_li"] = rev_df["line_item_name"].str.lower()
+                    rev_df["_text"] = (rev_df["_cat"] + " " + rev_df["_sub"] + " " + rev_df["_li"]).str.strip()
+                    rev_df["_amount"] = pd.to_numeric(rev_df.get("amount"), errors="coerce").fillna(0.0).abs()
+
+                    # Identify revenue rows using broad heuristics (consistent with aggregation logic)
+                    expense_markers = (
+                        "cogs|cost of|expense|opex|operating expense|overhead|admin|administration|"
+                        "depreciation|amort|tax|interest|finance cost"
+                    )
+                    rev_markers = "revenue|sales|turnover|existing customer|prospective customer|installed base"
+                    item_markers = "wear part|wear parts|wearparts|liner|liners|consumable|refurb|refurbishment|service"
+
+                    is_rev = (
+                        rev_df["_text"].str.contains(rev_markers, na=False)
+                        | (
+                            rev_df["_text"].str.contains(item_markers, na=False)
+                            & ~rev_df["_text"].str.contains(expense_markers, na=False)
+                        )
+                    )
+                    revenue_items = rev_df[is_rev].copy()
+                except Exception:
+                    revenue_items = period_df[period_df.get("category", "").astype(str).str.contains("Revenue", case=False, na=False)]
+
+                if revenue_items is not None and not revenue_items.empty:
+                    # Segment detection: default to existing, switch to prospect when explicit
+                    def _seg(cat_val: str, sub_val: str) -> str:
+                        s = f"{cat_val} {sub_val}".strip().lower()
+                        if any(k in s for k in ["prospect", "prospective", "pipeline", "new customer", "new customers"]):
+                            return "prospect"
+                        if any(k in s for k in ["existing", "current", "installed base"]):
+                            return "existing"
+                        return "existing"
+
+                    # Accumulate segment totals for the period (so subtotal rows reflect reality)
+                    rev_wear_existing = 0.0
+                    rev_service_existing = 0.0
+                    rev_wear_prospect = 0.0
+                    rev_service_prospect = 0.0
+
+                    # Segment each row first, then aggregate by (segment, line_item_name)
+                    try:
+                        _seg_text = (
+                            revenue_items.get("category", "").fillna("").astype(str).str.lower()
+                            + " "
+                            + revenue_items.get("sub_category", "").fillna("").astype(str).str.lower()
+                        )
+                        revenue_items = revenue_items.copy()
+                        revenue_items["_seg"] = _seg_text.apply(lambda t: _seg(t, ""))  # _seg expects cat+sub combined
+                    except Exception:
+                        revenue_items = revenue_items.copy()
+                        revenue_items["_seg"] = "existing"
+
+                    for (seg, li_name), item_group in revenue_items.groupby(["_seg", "line_item_name"]):
+                        amt = float(pd.to_numeric(item_group.get("amount"), errors="coerce").fillna(0.0).sum())
+                        amt = abs(amt) if amt < 0 else amt
+
+                        li_lower = str(li_name).strip().lower()
+                        if any(k in li_lower for k in ["wear", "liner", "consum"]):
+                            if str(seg) == "prospect":
+                                rev_wear_prospect += amt
+                            else:
+                                rev_wear_existing += amt
+                        elif any(k in li_lower for k in ["refurb", "service"]):
+                            if str(seg) == "prospect":
+                                rev_service_prospect += amt
+                            else:
+                                rev_service_existing += amt
+
+                    # Write back detail columns (only for actual rows; merge function is already scoped)
+                    if "rev_wear_existing" in monthly_data.columns and rev_wear_existing != 0:
+                        monthly_data.loc[idx, "rev_wear_existing"] = rev_wear_existing
+                    if "rev_service_existing" in monthly_data.columns and rev_service_existing != 0:
+                        monthly_data.loc[idx, "rev_service_existing"] = rev_service_existing
+                    if "rev_wear_prospect" in monthly_data.columns and rev_wear_prospect != 0:
+                        monthly_data.loc[idx, "rev_wear_prospect"] = rev_wear_prospect
+                    if "rev_service_prospect" in monthly_data.columns and rev_service_prospect != 0:
+                        monthly_data.loc[idx, "rev_service_prospect"] = rev_service_prospect
+
+                    # Derive subtotals when we have a segmented breakdown
+                    existing_total = rev_wear_existing + rev_service_existing
+                    prospect_total = rev_wear_prospect + rev_service_prospect
+                    if "revenue_existing" in monthly_data.columns and existing_total != 0:
+                        monthly_data.loc[idx, "revenue_existing"] = existing_total
+                    if "revenue_prospect" in monthly_data.columns and prospect_total != 0:
+                        monthly_data.loc[idx, "revenue_prospect"] = prospect_total
+
+                    # If historical aggregate missed revenue entirely, backfill total_revenue from details
+                    if "total_revenue" in monthly_data.columns and (existing_total + prospect_total) != 0:
+                        try:
+                            cur_total = monthly_data.loc[idx, "total_revenue"]
+                            if pd.isna(cur_total) or float(cur_total) == 0.0:
+                                monthly_data.loc[idx, "total_revenue"] = existing_total + prospect_total
+                        except Exception:
+                            pass
         
         return monthly_data
     
@@ -5345,7 +5466,7 @@ Your data may only be in session memory and will be lost when you close the brow
                     from components.ai_assumptions_engine import load_historical_data
                     _hist = load_historical_data(db, scenario_id, user_id)
                 except Exception:
-                    _hist = load_historical_financials(db, scenario_id)
+                    _hist = load_historical_financials(db, scenario_id, user_id)
 
                 if _hist is None or _hist.empty:
                     st.warning("No historical rows available to diagnose.")
@@ -5438,7 +5559,7 @@ Your data may only be in session memory and will be lost when you close the brow
             historical_df['data_type'] = 'Actual'
     except Exception:
         # Fallback to old method
-        historical_df = load_historical_financials(db, scenario_id)
+        historical_df = load_historical_financials(db, scenario_id, user_id)
         if not historical_df.empty:
             historical_df['is_actual'] = True
             historical_df['data_type'] = 'Actual'
@@ -5485,7 +5606,7 @@ Your data may only be in session memory and will be lost when you close the brow
         
         with fs_tab1:
             # Financial statement controls
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3, col4, col5 = st.columns(5)
             
             with col1:
                 view_mode = st.radio(
@@ -5516,6 +5637,16 @@ Your data may only be in session memory and will be lost when you close the brow
                     "💼 Expense Detail",
                     value=True,
                     key="fs_opex_detail_results"
+                )
+
+            with col5:
+                period_window = st.radio(
+                    "🪟 Window",
+                    options=["latest", "earliest"],
+                    format_func=lambda v: "Latest" if v == "latest" else "Earliest",
+                    horizontal=True,
+                    key="fs_period_window_results",
+                    help="If forecast columns feel 'missing', switch to Latest to see the most recent (incl. forecast) periods."
                 )
             
             st.markdown("---")
@@ -5567,7 +5698,8 @@ Your data may only be in session memory and will be lost when you close the brow
                     data=display_data,
                     show_revenue_detail=show_revenue_detail,
                     show_opex_detail=show_opex_detail,
-                    view_mode=view_mode
+                    view_mode=view_mode,
+                    period_window=period_window,
                 )
             else:
                 st.warning("Could not build financial statements from forecast data.")

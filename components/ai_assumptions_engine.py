@@ -1320,6 +1320,10 @@ def aggregate_detailed_line_items_to_summary(db, scenario_id: str, user_id: str 
             # Remove any duplicate rows (same period_date + line_item_name)
             if len(is_li_df) > 0:
                 is_li_df = is_li_df.drop_duplicates(subset=['period_date', 'line_item_name'], keep='first')
+
+        # Ensure amount is numeric (Supabase may return NUMERIC as strings)
+        if 'amount' in is_li_df.columns:
+            is_li_df['amount'] = pd.to_numeric(is_li_df['amount'], errors='coerce').fillna(0.0)
         
         if is_li_df.empty:
             return pd.DataFrame()
@@ -1330,43 +1334,58 @@ def aggregate_detailed_line_items_to_summary(db, scenario_id: str, user_id: str 
         # Group by period_date - this automatically handles uniqueness
         grouped = is_li_df.groupby('period_date', dropna=True)
         
-        def _classify_is_row(cat: str, name: str) -> str:
+        def _classify_is_row(cat: str, name: str, sub_category: str = None, amount: Any = None) -> str:
             """
             Map imported line items into canonical buckets.
 
             We accept a wide variety of category labels from uploads and map them
             into Revenue / COGS / OPEX / Depreciation / Interest / Tax / Other Income.
             """
-            c = (cat or "").strip().lower()
-            n = (name or "").strip().lower()
+            # Robust string normalization (avoid .strip() on NaN/float)
+            c = str(cat).strip().lower() if cat is not None and pd.notna(cat) else ""
+            n = str(name).strip().lower() if name is not None and pd.notna(name) else ""
+            sc = str(sub_category).strip().lower() if sub_category is not None and pd.notna(sub_category) else ""
+            s = f"{c} {sc} {n}".strip()
 
-            # Revenue
-            if "revenue" in c or "sales" in c:
-                return "revenue"
+            # Other income (keep separate so we don't understate EBITDA)
+            if ("other income" in s) or ("finance income" in s) or ("interest received" in s):
+                return "other_income"
 
             # COGS / Cost of Sales
-            if ("cost of sales" in c) or ("cogs" in c) or ("cost of goods" in c) or ("purchases" in c):
+            if any(k in s for k in ["cost of sales", "cogs", "cost of goods", "cost of goods sold", "purchases", "direct cost", "direct costs"]):
                 return "cogs"
 
+            # Revenue (broad)
+            if any(k in s for k in ["revenue", "sales", "turnover"]):
+                return "revenue"
+
+            # Domain-specific revenue labels (Installed Base model)
+            # Many uploads use segment headers like "Existing Customers" / "Prospective Customers"
+            # with revenue items like "Wear Parts" / "Refurbishment & Service".
+            if any(k in s for k in ["existing customer", "existing customers", "prospective customer", "prospective customers", "installed base"]):
+                return "revenue"
+
+            # Revenue line-items that often appear without an explicit "Revenue" category
+            # Guard against misclassifying costs/expenses.
+            if any(k in s for k in ["wear part", "wear parts", "wearparts", "liner", "liners", "consumable", "refurb", "refurbishment", "service"]):
+                if not any(k in s for k in ["expense", "opex", "operating expense", "operating expenses", "overhead", "admin", "administration", "depreciation", "amort", "tax", "interest", "finance cost", "finance costs"]):
+                    return "revenue"
+
             # Depreciation & amortisation
-            if ("depreciation" in c) or ("amort" in c) or ("depreciation" in n) or ("amort" in n):
+            if ("depreciation" in s) or ("amort" in s):
                 return "depreciation"
 
             # Interest / finance costs
-            if ("finance cost" in c) or ("finance costs" in c) or ("interest" in c) or ("interest" in n):
+            if ("finance cost" in s) or ("finance costs" in s) or ("interest" in s):
                 return "interest"
 
             # Tax
-            if ("tax" in c) or ("taxation" in c) or ("tax" in n):
+            if ("tax" in s) or ("taxation" in s):
                 return "tax"
-
-            # Other income (keep separate so we don't understate EBITDA)
-            if ("other income" in c) or ("finance income" in c) or ("interest received" in n):
-                return "other_income"
 
             # Everything else that is an expense bucket should flow into OPEX.
             # Common labels: Other Expense, Distribution Cost, Operating Expenses, Admin, etc.
-            if ("expense" in c) or ("operating" in c) or ("distribution" in c) or ("overhead" in c) or ("admin" in c):
+            if any(k in s for k in ["expense", "operating", "distribution", "overhead", "admin", "administration"]):
                 return "opex"
 
             # Default: treat as OPEX (safer than dropping)
@@ -1377,12 +1396,16 @@ def aggregate_detailed_line_items_to_summary(db, scenario_id: str, user_id: str 
 
             # Ensure we can classify even if category is missing
             cats = period_df.get('category')
+            subs = period_df.get('sub_category')
             names = period_df.get('line_item_name')
+            amts = period_df.get('amount')
             period_df = period_df.copy()
             period_df['__bucket'] = [
                 _classify_is_row(
                     (cats.iloc[i] if cats is not None else None),
-                    (names.iloc[i] if names is not None else None)
+                    (names.iloc[i] if names is not None else None),
+                    (subs.iloc[i] if subs is not None else None),
+                    (amts.iloc[i] if amts is not None else None),
                 )
                 for i in range(len(period_df))
             ]

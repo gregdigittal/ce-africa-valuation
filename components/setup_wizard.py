@@ -555,6 +555,13 @@ def render_step_historics(db, scenario_id: str, user_id: str):
         s = f"{c} {li}".strip()
         if any(k in s for k in ["revenue", "rev", "sales", "turnover"]):
             return "revenue"
+        # Installed Base model often uses segment headers without literal "Revenue"
+        if any(k in s for k in ["existing customer", "existing customers", "prospective customer", "prospective customers", "installed base"]):
+            return "revenue"
+        # Revenue items that commonly appear under segment headers (e.g. Wear Parts / Refurbishment & Service)
+        if any(k in s for k in ["wear part", "wear parts", "wearparts", "liner", "liners", "consumable", "refurb", "refurbishment", "service"]):
+            if not any(k in s for k in ["cogs", "cost of", "expense", "opex", "operating expense", "overhead", "admin", "depreciation", "amort", "tax", "interest", "finance cost"]):
+                return "revenue"
         if any(k in s for k in ["cogs", "cost of sales", "cost_of_sales", "costs of sales", "direct cost"]):
             return "cogs"
         if any(k in s for k in ["opex", "operating expense", "operating expenses", "overhead", "sg&a", "sga"]):
