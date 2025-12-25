@@ -68,6 +68,12 @@ import urllib.request
 import urllib.error
 from urllib.parse import urljoin
 
+# Supabase helpers (avoid silent 1000-row truncation on large selects)
+try:
+    from supabase_pagination import fetch_all_rows
+except Exception:
+    fetch_all_rows = None
+
 
 # =============================================================================
 # AI ASSUMPTIONS ENGINE INTEGRATION (NEW IN v9.0)
@@ -1410,9 +1416,14 @@ def load_forecast_data(db, scenario_id: str, user_id: str = None, force_refresh:
         except Exception:
             # FALLBACK: Query installed_base table (legacy schema)
             try:
-                installed_base = db.client.table(TABLE_INSTALLED_BASE).select('*').eq('scenario_id', scenario_id).execute()
+                q_ib = db.client.table(TABLE_INSTALLED_BASE).select('*').eq('scenario_id', scenario_id)
+                if fetch_all_rows:
+                    installed_base_rows = fetch_all_rows(q_ib, order_by="id")
+                else:
+                    installed_base = q_ib.execute()
+                    installed_base_rows = installed_base.data or []
 
-                if installed_base.data and len(installed_base.data) > 0:
+                if installed_base_rows and len(installed_base_rows) > 0:
                     # Load wear profiles (user-scoped if possible)
                     wear_profiles_result = None
                     try:
@@ -1427,7 +1438,7 @@ def load_forecast_data(db, scenario_id: str, user_id: str = None, force_refresh:
 
                     # Transform installed_base format to expected format
                     transformed_machines = []
-                    for machine in installed_base.data:
+                    for machine in installed_base_rows:
                         model = (machine.get('machine_model', '') or machine.get('Model', '') or '').strip()
                         profile = wear_profile_dict.get(model.lower(), {})
 

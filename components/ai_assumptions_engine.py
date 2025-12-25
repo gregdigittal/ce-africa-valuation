@@ -39,6 +39,12 @@ from enum import Enum
 import json
 import traceback
 
+# Supabase helpers (avoid silent 1000-row truncation on large selects)
+try:
+    from supabase_pagination import fetch_all_rows
+except Exception:
+    fetch_all_rows = None
+
 # Import trend forecast analyzer
 try:
     from components.trend_forecast_analyzer import render_trend_forecast_ui
@@ -1928,20 +1934,31 @@ def load_detailed_line_items(db, scenario_id: str, statement_type: str = 'income
     try:
         if hasattr(db, 'client'):
             base_query = db.client.table(table_name).select('*').eq('scenario_id', scenario_id)
-            response = None
+            rows: List[Dict[str, Any]] = []
 
-            # Try with user_id filter first (RLS-friendly), then fall back to scenario-only
-            if user_id:
-                try:
-                    response = base_query.eq('user_id', user_id).order('period_date').execute()
-                except Exception:
-                    response = None
+            # Prefer user_id filter (RLS-friendly), then fall back to scenario-only.
+            # IMPORTANT: Supabase/PostgREST commonly caps responses to 1000 rows; paginate.
+            if fetch_all_rows:
+                if user_id:
+                    try:
+                        rows = fetch_all_rows(base_query.eq('user_id', user_id), order_by="id")
+                    except Exception:
+                        rows = []
+                if not rows:
+                    rows = fetch_all_rows(base_query, order_by="id")
+            else:
+                response = None
+                if user_id:
+                    try:
+                        response = base_query.eq('user_id', user_id).order('period_date').execute()
+                    except Exception:
+                        response = None
+                if response is None or not getattr(response, 'data', None):
+                    response = base_query.order('period_date').execute()
+                rows = response.data or [] if response and getattr(response, 'data', None) else []
 
-            if response is None or not getattr(response, 'data', None):
-                response = base_query.order('period_date').execute()
-            
-            if response.data:
-                df = pd.DataFrame(response.data)
+            if rows:
+                df = pd.DataFrame(rows)
                 if 'period_date' in df.columns:
                     df['period_date'] = pd.to_datetime(df['period_date'], errors='coerce')
                     # Remove any rows with invalid dates
@@ -2010,10 +2027,12 @@ def load_parts_data(db, scenario_id: str, user_id: str = None) -> pd.DataFrame:
             installed_base_data = db.get_installed_base(scenario_id) or []
         elif hasattr(db, 'client'):
             try:
-                response = db.client.table('installed_base').select('*').eq(
-                    'scenario_id', scenario_id
-                ).execute()
-                installed_base_data = response.data or []
+                q = db.client.table('installed_base').select('*').eq('scenario_id', scenario_id)
+                if fetch_all_rows:
+                    installed_base_data = fetch_all_rows(q, order_by="id")
+                else:
+                    response = q.execute()
+                    installed_base_data = response.data or []
             except:
                 pass
         

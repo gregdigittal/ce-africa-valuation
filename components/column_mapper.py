@@ -32,6 +32,12 @@ from typing import Dict, Optional, List, Tuple, Callable, Any
 from datetime import datetime
 import re
 
+# Supabase helpers (avoid silent 1000-row truncation on verification reads)
+try:
+    from supabase_pagination import fetch_all_rows
+except Exception:
+    fetch_all_rows = None
+
 
 # =============================================================================
 # WIDE TO LONG FORMAT TRANSFORMATION (NEW)
@@ -2407,10 +2413,19 @@ def render_import_with_mapping(
 
         # Prefer user_id filter when available, but fall back if schema/RLS differs
         try:
-            resp = base.eq("user_id", user_id).execute()
+            q = base.eq("user_id", user_id)
         except Exception:
-            resp = base.execute()
-        return pd.DataFrame(resp.data) if getattr(resp, "data", None) else pd.DataFrame()
+            q = base
+
+        try:
+            if fetch_all_rows:
+                rows = fetch_all_rows(q, order_by="id")
+            else:
+                resp = q.execute()
+                rows = resp.data if getattr(resp, "data", None) else []
+        except Exception:
+            rows = []
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
 
     def _summarize_db_line_items(df: pd.DataFrame, kind: str) -> pd.DataFrame:
         if df.empty:

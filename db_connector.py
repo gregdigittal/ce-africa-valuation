@@ -16,6 +16,11 @@ from supabase import create_client, Client
 from typing import List, Dict, Optional, Any
 from datetime import datetime
 
+# Supabase helpers (avoid silent 1000-row truncation on large selects)
+try:
+    from supabase_pagination import fetch_all_rows
+except Exception:
+    fetch_all_rows = None
 
 class SupabaseHandler:
     """
@@ -559,8 +564,11 @@ class SupabaseHandler:
             )
             if site_id:
                 query = query.eq("site_id", site_id)
+            if fetch_all_rows:
+                rows = fetch_all_rows(query, order_by="id")
+                return rows or []
             response = query.execute()
-            return response.data if response.data else []
+            return response.data if response and getattr(response, "data", None) else []
         except Exception as e:
             st.error(f"Error loading machine instances: {e}")
             return []

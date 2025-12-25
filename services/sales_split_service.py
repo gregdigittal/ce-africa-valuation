@@ -22,6 +22,11 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# Supabase helpers (avoid silent 1000-row truncation)
+try:
+    from supabase_pagination import fetch_all_rows
+except Exception:
+    fetch_all_rows = None
 
 WEAR_KEYWORDS = [
     # common wear/parts terms
@@ -89,14 +94,18 @@ def load_sales_orders_df(db, scenario_id: str, user_id: str) -> pd.DataFrame:
     if not hasattr(db, "client"):
         return pd.DataFrame()
     try:
-        resp = (
+        q = (
             db.client.table("sales_orders")
             .select("order_date,total_amount,item_code,description,customer_name,customer_code,order_number")
             .eq("scenario_id", scenario_id)
             .eq("user_id", user_id)
-            .execute()
         )
-        return pd.DataFrame(resp.data) if resp.data else pd.DataFrame()
+        if fetch_all_rows:
+            rows = fetch_all_rows(q, order_by="id")
+        else:
+            resp = q.execute()
+            rows = resp.data if resp and getattr(resp, "data", None) else []
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 

@@ -9,6 +9,12 @@ import pandas as pd
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
+# Supabase helpers (avoid silent 1000-row truncation)
+try:
+    from supabase_pagination import fetch_all_rows
+except Exception:
+    fetch_all_rows = None
+
 # Database handler
 try:
     from db_connector import SupabaseHandler
@@ -99,8 +105,14 @@ def load_table_data(
             if scenario_id:
                 query = query.eq("scenario_id", scenario_id)
 
-        result = query.execute()
-        return pd.DataFrame(result.data) if result.data else pd.DataFrame()
+        # IMPORTANT: Supabase/PostgREST often caps responses to 1000 rows.
+        # Use pagination so historics, sales orders, and fleets don't silently truncate.
+        if fetch_all_rows:
+            data = fetch_all_rows(query, order_by="id")
+        else:
+            result = query.execute()
+            data = result.data if result and getattr(result, "data", None) else []
+        return pd.DataFrame(data) if data else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
