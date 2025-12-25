@@ -336,14 +336,139 @@ def get_historics_diagnostics_api(db, scenario_id: str, user_id: str) -> Dict[st
         assumptions = {}
 
     ip = (assumptions or {}).get("import_period_settings") or {}
-    expected = []
+
+    def _expected_periods(key: str) -> List[str]:
+        try:
+            blk = (ip.get(key) or {}) if isinstance(ip, dict) else {}
+            sel = blk.get("selected_periods") or []
+            if isinstance(sel, list):
+                return [str(x).strip() for x in sel if str(x).strip()]
+        except Exception:
+            pass
+        return []
+
+    expected_is = _expected_periods("historical_income_statement_line_items")
+    expected_bs = _expected_periods("historical_balance_sheet_line_items")
+    expected_cf = _expected_periods("historical_cashflow_line_items")
+
+    def _fetch_periods(table: str) -> List[str]:
+        try:
+            resp = (
+                db.client.table(table)
+                .select("period_date")
+                .eq("scenario_id", scenario_id)
+                .eq("user_id", user_id)
+                .order("period_date")
+                .execute()
+            )
+            rows = resp.data or []
+            if not rows:
+                return []
+            df = pd.DataFrame(rows)
+            if "period_date" not in df.columns:
+                return []
+            return (
+                pd.to_datetime(df["period_date"], errors="coerce")
+                .dt.to_period("M")
+                .astype(str)
+                .dropna()
+                .tolist()
+            )
+        except Exception:
+            return []
+
+    def _bs_bucketize(category: str, name: str) -> str:
+        s = f"{(category or '').strip().lower()} {(name or '').strip().lower()}".strip()
+        if "asset" in s:
+            return "assets"
+        if any(k in s for k in ["liabil", "payable", "debt"]):
+            return "liabilities"
+        if any(k in s for k in ["equity", "retained", "share capital"]):
+            return "equity"
+        return "other"
+
+    def _cf_bucketize(category: str, name: str) -> str:
+        s = f"{(category or '').strip().lower()} {(name or '').strip().lower()}".strip()
+        if any(k in s for k in ["operating", "operations", "cfo"]):
+            return "operating"
+        if any(k in s for k in ["investing", "cfi", "capex", "capital"]):
+            return "investing"
+        if any(k in s for k in ["financing", "cff", "debt", "equity", "dividend"]):
+            return "financing"
+        return "other"
+
+    def _summarize_bs() -> List[Dict[str, Any]]:
+        try:
+            resp = (
+                db.client.table("historical_balance_sheet_line_items")
+                .select("period_date,category,line_item_name,amount")
+                .eq("scenario_id", scenario_id)
+                .eq("user_id", user_id)
+                .order("period_date")
+                .execute()
+            )
+            rows = resp.data or []
+            if not rows:
+                return []
+            df = pd.DataFrame(rows)
+            df["period"] = pd.to_datetime(df["period_date"], errors="coerce").dt.to_period("M").astype(str)
+            df["amount"] = pd.to_numeric(df.get("amount"), errors="coerce").fillna(0.0)
+            df["bucket"] = df.apply(lambda r: _bs_bucketize(r.get("category"), r.get("line_item_name")), axis=1)
+            grouped = df.groupby(["period", "bucket"], dropna=False)["amount"].sum().unstack("bucket", fill_value=0.0).reset_index()
+            for c in ["assets", "liabilities", "equity"]:
+                if c not in grouped.columns:
+                    grouped[c] = 0.0
+            grouped["balance_check"] = grouped["assets"] - (grouped["liabilities"] + grouped["equity"])
+            out = grouped.sort_values("period")
+            for c in ["assets", "liabilities", "equity", "balance_check"]:
+                out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+            return out.to_dict(orient="records")
+        except Exception:
+            return []
+
+    def _summarize_cf() -> List[Dict[str, Any]]:
+        try:
+            resp = (
+                db.client.table("historical_cashflow_line_items")
+                .select("period_date,category,line_item_name,amount")
+                .eq("scenario_id", scenario_id)
+                .eq("user_id", user_id)
+                .order("period_date")
+                .execute()
+            )
+            rows = resp.data or []
+            if not rows:
+                return []
+            df = pd.DataFrame(rows)
+            df["period"] = pd.to_datetime(df["period_date"], errors="coerce").dt.to_period("M").astype(str)
+            df["amount"] = pd.to_numeric(df.get("amount"), errors="coerce").fillna(0.0)
+            df["bucket"] = df.apply(lambda r: _cf_bucketize(r.get("category"), r.get("line_item_name")), axis=1)
+            grouped = df.groupby(["period", "bucket"], dropna=False)["amount"].sum().unstack("bucket", fill_value=0.0).reset_index()
+            for c in ["operating", "investing", "financing"]:
+                if c not in grouped.columns:
+                    grouped[c] = 0.0
+            grouped["net_cash_flow"] = grouped["operating"] + grouped["investing"] + grouped["financing"]
+            out = grouped.sort_values("period")
+            for c in ["operating", "investing", "financing", "net_cash_flow"]:
+                out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+            return out.to_dict(orient="records")
+        except Exception:
+            return []
+
+    # Found periods for each statement
+    found_is = []
+    found_bs = _fetch_periods("historical_balance_sheet_line_items")
+    found_cf = _fetch_periods("historical_cashflow_line_items")
+
+    monthly_bs = _summarize_bs()
+    monthly_cf = _summarize_cf()
+
+    # IS existing logic below (keeps post-upsampling buckets)
+    expected = expected_is
     try:
-        blk = (ip.get("historical_income_statement_line_items") or {}) if isinstance(ip, dict) else {}
-        sel = blk.get("selected_periods") or []
-        if isinstance(sel, list):
-            expected = [str(x).strip() for x in sel if str(x).strip()]
+        expected = expected_is
     except Exception:
-        expected = []
+        expected = expected_is
 
     hist_df, diag = load_income_statement_history(db, scenario_id)
     used_sales_pattern = False
@@ -370,6 +495,7 @@ def get_historics_diagnostics_api(db, scenario_id: str, user_id: str) -> Dict[st
     if not hist_df.empty and "period_date" in hist_df.columns:
         _p = pd.to_datetime(hist_df["period_date"], errors="coerce").dt.to_period("M").astype(str)
         found = sorted(set([x for x in _p.dropna().tolist() if isinstance(x, str) and x.strip()]))
+        found_is = found
 
         view = hist_df.copy()
         view["period"] = pd.to_datetime(view["period_date"], errors="coerce").dt.to_period("M").astype(str)
@@ -380,16 +506,30 @@ def get_historics_diagnostics_api(db, scenario_id: str, user_id: str) -> Dict[st
                 view[c] = pd.to_numeric(view[c], errors="coerce").fillna(0.0)
         monthly = view.sort_values("period").to_dict(orient="records")
 
-    missing = sorted(set(expected) - set(found)) if expected else []
-    extra = sorted(set(found) - set(expected)) if expected else []
+    missing = sorted(set(expected_is) - set(found_is)) if expected_is else []
+    extra = sorted(set(found_is) - set(expected_is)) if expected_is else []
+    missing_bs = sorted(set(expected_bs) - set(found_bs)) if expected_bs else []
+    extra_bs = sorted(set(found_bs) - set(expected_bs)) if expected_bs else []
+    missing_cf = sorted(set(expected_cf) - set(found_cf)) if expected_cf else []
+    extra_cf = sorted(set(found_cf) - set(expected_cf)) if expected_cf else []
 
     return {
         "scenario_id": scenario_id,
-        "expected_periods_is": expected,
-        "found_periods_is": found,
+        "expected_periods_is": expected_is,
+        "found_periods_is": found_is,
         "missing_periods_is": missing,
         "extra_periods_is": extra,
         "income_statement_monthly": monthly,
+        "expected_periods_bs": expected_bs,
+        "found_periods_bs": found_bs,
+        "missing_periods_bs": missing_bs,
+        "extra_periods_bs": extra_bs,
+        "balance_sheet_monthly": monthly_bs,
+        "expected_periods_cf": expected_cf,
+        "found_periods_cf": found_cf,
+        "missing_periods_cf": missing_cf,
+        "extra_periods_cf": extra_cf,
+        "cash_flow_monthly": monthly_cf,
         "used_sales_pattern": used_sales_pattern,
         "source_diag": diag,
     }

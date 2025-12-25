@@ -4892,7 +4892,40 @@ Best when you have reliable historical financials and want trend-driven forecast
                     if exec_mode == "API (background)":
                         if st.button("Fetch historics diagnostics (API)", use_container_width=True, key="fetch_hist_diag_api"):
                             diag_url = urljoin(api_base_url, f"v1/scenarios/{scenario_id}/historics/diagnostics?user_id={user_id}")
-                            st.json(_http_json("GET", diag_url, payload=None, timeout=30))
+                            diag = _http_json("GET", diag_url, payload=None, timeout=30)
+                            if not isinstance(diag, dict):
+                                st.json(diag)
+                                return
+
+                            # Coverage summary
+                            for key, label in [("is", "Income Statement"), ("bs", "Balance Sheet"), ("cf", "Cash Flow")]:
+                                missing = diag.get(f"missing_periods_{key}") or []
+                                if isinstance(missing, list) and missing:
+                                    st.error(f"{label}: missing periods: {', '.join(missing[:12])}{' ...' if len(missing) > 12 else ''}")
+                                extra = diag.get(f"extra_periods_{key}") or []
+                                if isinstance(extra, list) and extra:
+                                    st.info(f"{label}: extra periods in DB: {', '.join(extra[:12])}{' ...' if len(extra) > 12 else ''}")
+
+                            st.caption(f"Used sales pattern: **{bool(diag.get('used_sales_pattern'))}**")
+
+                            # Render tables (if present)
+                            is_rows = diag.get("income_statement_monthly") or []
+                            if isinstance(is_rows, list) and is_rows:
+                                st.markdown("**Income Statement (monthly buckets)**")
+                                st.dataframe(pd.DataFrame(is_rows), hide_index=True, use_container_width=True)
+
+                            bs_rows = diag.get("balance_sheet_monthly") or []
+                            if isinstance(bs_rows, list) and bs_rows:
+                                st.markdown("**Balance Sheet (monthly buckets)**")
+                                st.dataframe(pd.DataFrame(bs_rows), hide_index=True, use_container_width=True)
+
+                            cf_rows = diag.get("cash_flow_monthly") or []
+                            if isinstance(cf_rows, list) and cf_rows:
+                                st.markdown("**Cash Flow (monthly buckets)**")
+                                st.dataframe(pd.DataFrame(cf_rows), hide_index=True, use_container_width=True)
+
+                            with st.expander("Raw diagnostics JSON", expanded=False):
+                                st.json(diag)
                 except Exception:
                     pass
     except Exception:
