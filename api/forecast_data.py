@@ -5,6 +5,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# Supabase helpers (avoid silent 1000-row truncation on large selects)
+try:
+    from supabase_pagination import fetch_all_rows
+except Exception:
+    fetch_all_rows = None
+
 
 def _classify_is_row(category: Optional[str], name: Optional[str]) -> str:
     c = (category or "").strip().lower()
@@ -37,14 +43,17 @@ def load_income_statement_history(db, scenario_id: str) -> Tuple[pd.DataFrame, D
     """
     diag: Dict[str, Any] = {"source": "historical_income_statement_line_items", "rows": 0}
     try:
-        resp = (
+        q = (
             db.client.table("historical_income_statement_line_items")
-            .select("period_date, category, sub_category, line_item_name, amount")
+            .select("id, period_date, category, sub_category, line_item_name, amount")
             .eq("scenario_id", scenario_id)
             .order("period_date")
-            .execute()
         )
-        rows = resp.data or []
+        if fetch_all_rows:
+            rows = fetch_all_rows(q, order_by="id")
+        else:
+            resp = q.execute()
+            rows = resp.data or []
     except Exception as e:
         diag["error"] = str(e)
         return pd.DataFrame(), diag
@@ -102,13 +111,18 @@ def _get_monthly_sales_pattern_api(db, scenario_id: str) -> Optional[np.ndarray]
             scen_user_id = scen.data[0]["user_id"]
         if not scen_user_id:
             return None
-        resp = (
+        q = (
             db.client.table("granular_sales_history")
             .select("date, quantity, unit_price_sold")
             .eq("user_id", scen_user_id)
-            .execute()
         )
-        rows = resp.data or []
+        if fetch_all_rows:
+            # Safety cap to avoid runaway loads; seasonality converges quickly
+            rows = fetch_all_rows(q, order_by="date", max_rows=50_000)
+        else:
+            resp = q.execute()
+            rows = resp.data or []
+
         if len(rows) >= 12:
             sdf = pd.DataFrame(rows)
             sdf["date"] = pd.to_datetime(sdf["date"], errors="coerce")
@@ -129,14 +143,17 @@ def _get_monthly_sales_pattern_api(db, scenario_id: str) -> Optional[np.ndarray]
 
         # Fallback: scenario-scoped sales orders (requires sales_orders table)
         try:
-            so = (
+            so_q = (
                 db.client.table("sales_orders")
-                .select("order_date,total_amount")
+                .select("id, order_date, total_amount")
                 .eq("scenario_id", scenario_id)
                 .eq("user_id", scen_user_id)
-                .execute()
             )
-            so_rows = so.data or []
+            if fetch_all_rows:
+                so_rows = fetch_all_rows(so_q, order_by="id", max_rows=50_000)
+            else:
+                so = so_q.execute()
+                so_rows = so.data or []
             if len(so_rows) >= 12:
                 odf = pd.DataFrame(so_rows)
                 odf["order_date"] = pd.to_datetime(odf["order_date"], errors="coerce")
@@ -427,15 +444,18 @@ def get_historics_diagnostics_api(db, scenario_id: str, user_id: str) -> Dict[st
 
     def _summarize_bs() -> List[Dict[str, Any]]:
         try:
-            resp = (
+            q = (
                 db.client.table("historical_balance_sheet_line_items")
-                .select("period_date,category,line_item_name,amount")
+                .select("id, period_date, category, line_item_name, amount")
                 .eq("scenario_id", scenario_id)
                 .eq("user_id", user_id)
                 .order("period_date")
-                .execute()
             )
-            rows = resp.data or []
+            if fetch_all_rows:
+                rows = fetch_all_rows(q, order_by="id")
+            else:
+                resp = q.execute()
+                rows = resp.data or []
             if not rows:
                 return []
             df = pd.DataFrame(rows)
@@ -456,15 +476,18 @@ def get_historics_diagnostics_api(db, scenario_id: str, user_id: str) -> Dict[st
 
     def _summarize_cf() -> List[Dict[str, Any]]:
         try:
-            resp = (
+            q = (
                 db.client.table("historical_cashflow_line_items")
-                .select("period_date,category,line_item_name,amount")
+                .select("id, period_date, category, line_item_name, amount")
                 .eq("scenario_id", scenario_id)
                 .eq("user_id", user_id)
                 .order("period_date")
-                .execute()
             )
-            rows = resp.data or []
+            if fetch_all_rows:
+                rows = fetch_all_rows(q, order_by="id")
+            else:
+                resp = q.execute()
+                rows = resp.data or []
             if not rows:
                 return []
             df = pd.DataFrame(rows)
