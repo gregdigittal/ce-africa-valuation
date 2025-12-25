@@ -1247,7 +1247,14 @@ def load_snapshots(db, scenario_id: str, limit: int = 10, user_id: Optional[str]
         if api_base and effective_user_id:
             try:
                 url = urljoin(api_base + "/", f"v1/scenarios/{scenario_id}/snapshots?user_id={effective_user_id}&limit={int(limit)}")
-                req = urllib.request.Request(url, headers={"Content-Type": "application/json"}, method="GET")
+                _headers = {"Content-Type": "application/json"}
+                try:
+                    jwt_token = os.getenv("FORECAST_API_JWT", "").strip()
+                    if jwt_token:
+                        _headers["Authorization"] = f"Bearer {jwt_token}"
+                except Exception:
+                    pass
+                req = urllib.request.Request(url, headers=_headers, method="GET")
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     raw = resp.read().decode("utf-8")
                     data = json.loads(raw) if raw else []
@@ -4612,8 +4619,27 @@ Best when you have reliable historical financials and want trend-driven forecast
     import urllib.error
     from urllib.parse import urljoin
     
+    def _get_api_jwt() -> Optional[str]:
+        """
+        Best-effort JWT getter for API calls.
+        - If you implement Supabase Auth later, stash the access token in session_state (any of these keys).
+        - Also supports an env override for local dev: FORECAST_API_JWT
+        """
+        try:
+            for k in ["access_token", "supabase_access_token", "jwt", "api_jwt"]:
+                v = st.session_state.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+        except Exception:
+            pass
+        env_jwt = os.getenv("FORECAST_API_JWT", "").strip()
+        return env_jwt or None
+
     def _http_json(method: str, url: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 30) -> Dict[str, Any]:
         headers = {"Content-Type": "application/json"}
+        jwt_token = _get_api_jwt()
+        if jwt_token:
+            headers["Authorization"] = f"Bearer {jwt_token}"
         data = None
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
@@ -6841,7 +6867,14 @@ def render_snapshots_tab(db, scenario_id: str, user_id: str):
                         if api_base:
                             try:
                                 url = urljoin(api_base + "/", f"v1/snapshots/{snapshot['id']}?user_id={user_id}")
-                                req = urllib.request.Request(url, headers={"Content-Type": "application/json"}, method="GET")
+                                _headers = {"Content-Type": "application/json"}
+                                try:
+                                    jwt_token = os.getenv("FORECAST_API_JWT", "").strip()
+                                    if jwt_token:
+                                        _headers["Authorization"] = f"Bearer {jwt_token}"
+                                except Exception:
+                                    pass
+                                req = urllib.request.Request(url, headers=_headers, method="GET")
                                 with urllib.request.urlopen(req, timeout=15) as resp:
                                     raw = resp.read().decode("utf-8")
                                     snap_row = json.loads(raw) if raw else {}

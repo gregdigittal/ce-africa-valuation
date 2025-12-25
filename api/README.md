@@ -12,6 +12,7 @@ Set these in your shell before starting the API/worker:
 - `SUPABASE_SERVICE_ROLE_KEY` (preferred for server-side jobs)
   - Alternatively: `SUPABASE_ANON_KEY` or `SUPABASE_KEY`
 - `REDIS_URL` (optional, defaults to `redis://localhost:6379/0`)
+- `FORECAST_API_JWT` (optional for Streamlit → API auth; Bearer token value)
 
 1) Start Redis (required for background jobs)
 
@@ -40,6 +41,8 @@ python3 -m api.worker
 - `GET /health`: liveness check
 - `POST /v1/forecasts/run`: enqueue a forecast job (runs existing engine in worker)
 - `GET /v1/jobs/{job_id}`: job status/result
+- `GET /v1/scenarios/{scenario_id}/snapshots`: list snapshots (Authorization preferred; `user_id` query is fallback)
+- `GET /v1/snapshots/{snapshot_id}`: get snapshot (Authorization preferred; `user_id` query is fallback)
 
 ### Quick test (curl)
 
