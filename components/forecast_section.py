@@ -717,6 +717,131 @@ def load_historical_financials(db, scenario_id: str) -> pd.DataFrame:
     return upsampled_df
 
 
+def validate_historical_import_coverage(
+    db,
+    scenario_id: str,
+    user_id: Optional[str] = None,
+    assumptions: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, List[str]]:
+    """
+    Hard gate before running forecasts:
+    - If import period selections exist, verify those months exist in DB for IS/BS/CF line items.
+    - For Income Statement, verify revenue totals are non-zero for at least one expected month.
+    Returns (ok, messages). Messages are human-readable errors/warnings.
+    """
+    msgs: List[str] = []
+    assumptions = assumptions or {}
+    ip = (assumptions or {}).get("import_period_settings") or {}
+    if not isinstance(ip, dict) or not ip:
+        return True, msgs  # no explicit expectations; don't block
+
+    def _expected_periods(key: str) -> List[str]:
+        block = ip.get(key) or {}
+        sel = block.get("selected_periods")
+        if isinstance(sel, list) and sel:
+            # stored as "YYYY-MM"
+            return [str(x) for x in sel if isinstance(x, (str, int, float)) and str(x).strip()]
+        return []
+
+    def _month_starts(labels: List[str]) -> List[str]:
+        out = []
+        for lbl in labels or []:
+            s = str(lbl).strip()
+            if re.match(r"^\d{4}-\d{2}$", s):
+                out.append(f"{s}-01")
+        return sorted(set(out))
+
+    def _fetch_periods(table: str, month_starts: List[str]) -> List[str]:
+        if not month_starts:
+            return []
+        q = db.client.table(table).select("period_date").eq("scenario_id", scenario_id).in_("period_date", month_starts)
+        # prefer user_id where possible, but don't fail if schema/RLS differs
+        try:
+            if user_id:
+                q = q.eq("user_id", user_id)
+        except Exception:
+            pass
+        try:
+            resp = q.execute()
+        except Exception:
+            # fallback without user filter
+            resp = db.client.table(table).select("period_date").eq("scenario_id", scenario_id).in_("period_date", month_starts).execute()
+        rows = resp.data or []
+        if not rows:
+            return []
+        df = pd.DataFrame(rows)
+        if "period_date" not in df.columns:
+            return []
+        return (
+            pd.to_datetime(df["period_date"], errors="coerce")
+            .dt.to_period("M")
+            .astype(str)
+            .dropna()
+            .tolist()
+        )
+
+    def _revenue_nonzero(table: str, month_starts: List[str]) -> bool:
+        if not month_starts:
+            return True
+        q = (
+            db.client.table(table)
+            .select("period_date,category,line_item_name,amount")
+            .eq("scenario_id", scenario_id)
+            .in_("period_date", month_starts)
+        )
+        try:
+            if user_id:
+                q = q.eq("user_id", user_id)
+        except Exception:
+            pass
+        try:
+            resp = q.execute()
+        except Exception:
+            resp = (
+                db.client.table(table)
+                .select("period_date,category,line_item_name,amount")
+                .eq("scenario_id", scenario_id)
+                .in_("period_date", month_starts)
+                .execute()
+            )
+        rows = resp.data or []
+        if not rows:
+            return False
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return False
+        df["category"] = df.get("category", "").fillna("").astype(str).str.lower()
+        df["line_item_name"] = df.get("line_item_name", "").fillna("").astype(str).str.lower()
+        df["amount"] = pd.to_numeric(df.get("amount"), errors="coerce").fillna(0.0)
+        is_rev = df["category"].str.contains("revenue|sales|income|turnover", na=False) | df["line_item_name"].str.contains("revenue|sales|income|turnover", na=False)
+        return float(df.loc[is_rev, "amount"].sum()) != 0.0
+
+    checks = [
+        ("historical_income_statement_line_items", "historical_income_statement_line_items", "Income Statement"),
+        ("historical_balance_sheet_line_items", "historical_balance_sheet_line_items", "Balance Sheet"),
+        ("historical_cashflow_line_items", "historical_cashflow_line_items", "Cash Flow"),
+    ]
+
+    ok = True
+    for ip_key, table, label in checks:
+        expected = _expected_periods(ip_key)
+        if not expected:
+            continue
+        ms = _month_starts(expected)
+        found = set(_fetch_periods(table, ms))
+        missing = sorted(set(expected) - found)
+        if missing:
+            ok = False
+            msgs.append(f"{label}: missing imported periods in DB: {', '.join(missing[:12])}{' ...' if len(missing) > 12 else ''}")
+
+        if table == "historical_income_statement_line_items":
+            if not _revenue_nonzero(table, ms):
+                ok = False
+                msgs.append("Income Statement: revenue totals appear to be zero across expected months (check category/line item labels and amount parsing).")
+
+    return ok, msgs
+
+
 def _upsample_aggregate_financials(
     df: pd.DataFrame, 
     sales_pattern: Optional[np.ndarray] = None,
@@ -2337,6 +2462,7 @@ def build_monthly_financials(
     Returns DataFrame with all monthly periods and line items.
     """
     all_rows = []
+    existing_periods: set[tuple[int, int]] = set()
     
     # Add historical data first if available
     if historical_data is not None and not historical_data.empty:
@@ -2345,6 +2471,14 @@ def build_monthly_financials(
             if period_date is not None:
                 if isinstance(period_date, str):
                     period_date = pd.to_datetime(period_date)
+
+                # Prefer existing flags from upstream upsampling (YTD fill months)
+                try:
+                    _is_actual = row.get("is_actual")
+                    is_actual = bool(_is_actual) if _is_actual is not None else True
+                except Exception:
+                    is_actual = True
+                data_type = row.get("data_type") if isinstance(row.get("data_type"), str) else ("Actual" if is_actual else "Forecast (YTD fill)")
                 
                 # Get total opex for fallback calculations
                 total_opex = row.get('total_opex', row.get('opex', 0)) or 0
@@ -2377,8 +2511,8 @@ def build_monthly_financials(
                     'period_month': period_date.month,
                     'period_date': period_date.strftime('%Y-%m-%d'),
                     'period_label': period_date.strftime('%b %Y'),
-                    'is_actual': True,
-                    'data_type': 'Actual',
+                    'is_actual': is_actual,
+                    'data_type': data_type,
                     'is_annual_total': False,
                     'total_revenue': row.get('total_revenue', row.get('revenue', 0)) or 0,
                     'total_cogs': row.get('total_cogs', row.get('cogs', 0)) or 0,
@@ -2412,6 +2546,10 @@ def build_monthly_financials(
                     'ebt': ebt,
                     'tax_expense': tax_expense
                 })
+                try:
+                    existing_periods.add((int(period_date.year), int(period_date.month)))
+                except Exception:
+                    pass
     
     # Add forecast data
     timeline = forecast_result.get('timeline', [])
@@ -2474,6 +2612,14 @@ def build_monthly_financials(
     # NOTE: keep using current_year/current_month anchored above (latest historical period)
     # so we don't mistakenly treat an already-imported month as "missing".
     
+    # If historical data already includes flags (e.g. "Forecast (YTD fill)"),
+    # do not run the legacy YTD pre-load / gross-up logic (it causes duplicates).
+    historical_has_flags = bool(
+        historical_data is not None
+        and not historical_data.empty
+        and any(c in historical_data.columns for c in ["is_actual", "data_type"])
+    )
+
     # Check if we have historical data for current month or any YTD months
     has_current_month_actual = False
     has_ytd_actuals = False
@@ -2492,12 +2638,21 @@ def build_monthly_financials(
                 
                 # Check if this is current month
                 if hist_date.year == current_year and hist_date.month == current_month:
-                    has_current_month_actual = True
+                    # If upsampled history includes is_actual flags, honor them.
+                    try:
+                        if not historical_has_flags:
+                            has_current_month_actual = True
+                        else:
+                            _ia = hist_row.get("is_actual")
+                            has_current_month_actual = bool(_ia) if _ia is not None else True
+                    except Exception:
+                        has_current_month_actual = True
                 
                 # Check if this is any YTD month (current year, up to current month)
                 if hist_date.year == current_year and hist_date.month <= current_month:
-                    has_ytd_actuals = True
-                    ytd_actuals_data.append(hist_row.to_dict())
+                    if not historical_has_flags:
+                        has_ytd_actuals = True
+                        ytd_actuals_data.append(hist_row.to_dict())
     
     # NEW: Pre-load YTD actuals into all_rows before forecast loop
     # DIAGNOSTIC: Log YTD detection for debugging
@@ -2521,7 +2676,7 @@ def build_monthly_financials(
         'missing_months': missing_months,
     }
     
-    if has_ytd_actuals and ytd_actuals_data:
+    if (not historical_has_flags) and has_ytd_actuals and ytd_actuals_data:
         ytd_rows_added = []
         for ytd_row in ytd_actuals_data:
             hist_date = ytd_row.get('period_date')
@@ -2611,8 +2766,34 @@ def build_monthly_financials(
                         ytd_debug_info['ytd_periods'].append(filler_date.strftime('%Y-%m'))
     
     # Store diagnostics in session state for UI display
+    if historical_has_flags:
+        # Build a simpler diagnostic from the already-loaded monthly rows
+        try:
+            cy = int(current_year)
+            actual_months = sorted(
+                {
+                    int(r.get("period_month"))
+                    for r in all_rows
+                    if int(r.get("period_year", -1)) == cy and bool(r.get("is_actual", True))
+                }
+            )
+            ytd_debug_info["has_ytd_actuals"] = len(actual_months) > 0
+            ytd_debug_info["ytd_months_found"] = len(actual_months)
+            ytd_debug_info["ytd_periods"] = [f"{cy}-{m:02d}" for m in actual_months]
+        except Exception:
+            pass
     st.session_state['ytd_diagnostic'] = ytd_debug_info
     
+    # Rebuild existing_periods after any YTD filler rows were added
+    try:
+        existing_periods = {
+            (int(r.get("period_year")), int(r.get("period_month")))
+            for r in all_rows
+            if r.get("period_year") is not None and r.get("period_month") is not None
+        }
+    except Exception:
+        existing_periods = set()
+
     for i, period in enumerate(timeline):
         try:
             period_date = datetime.strptime(period, '%Y-%m')
@@ -2624,18 +2805,14 @@ def build_monthly_financials(
             else:
                 period_date = datetime.now().replace(day=1) + relativedelta(months=i)
         
-        # Skip this period if we already have data (actual or grossed-up) for it
-        if has_ytd_actuals:
-            period_year = period_date.year
-            period_month = period_date.month
-            if period_year == current_year and period_month <= 12:
-                already_added = any(
-                    row.get('period_year') == period_year and 
-                    row.get('period_month') == period_month
-                    for row in all_rows
-                )
-                if already_added:
-                    continue  # Skip forecast for this period, use existing data (actual or gross-up)
+        # Skip this period if we already have data (actual or YTD-fill) for it
+        try:
+            period_year = int(period_date.year)
+            period_month = int(period_date.month)
+            if (period_year, period_month) in existing_periods:
+                continue
+        except Exception:
+            pass
         
         # Revenue breakdown
         rev_wear_existing = consumables[i] if i < len(consumables) else 0
@@ -4685,6 +4862,23 @@ Best when you have reliable historical financials and want trend-driven forecast
             mfg_scenario = None
             if include_manufacturing:
                 mfg_scenario = st.session_state.get('vi_scenario')
+
+            # Gate: ensure expected historical imports actually exist in DB (prevents silent "no history" runs)
+            try:
+                assumptions_for_gate = {}
+                if hasattr(db, "get_scenario_assumptions"):
+                    assumptions_for_gate = db.get_scenario_assumptions(scenario_id, user_id) or {}
+                ok_hist, hist_msgs = validate_historical_import_coverage(db, scenario_id, user_id=user_id, assumptions=assumptions_for_gate)
+                if not ok_hist:
+                    progress_bar.empty()
+                    status.empty()
+                    st.error("Cannot run forecast until historics import issues are resolved:")
+                    for m in hist_msgs:
+                        st.error(f"- {m}")
+                    return
+            except Exception:
+                # Non-blocking on validator failure (but we still prefer it when it works)
+                pass
             
             # Run forecast
             results = run_forecast(db, scenario_id, user_id, progress_callback=update_progress, 
@@ -4728,6 +4922,20 @@ Best when you have reliable historical financials and want trend-driven forecast
         with cols[0]:
             if st.button("▶️ Run Forecast via API (Background)", type="primary", use_container_width=True, key="run_forecast_api_btn"):
                 try:
+                    # Gate before enqueuing (same checks as local mode)
+                    try:
+                        assumptions_for_gate = {}
+                        if hasattr(db, "get_scenario_assumptions"):
+                            assumptions_for_gate = db.get_scenario_assumptions(scenario_id, user_id) or {}
+                        ok_hist, hist_msgs = validate_historical_import_coverage(db, scenario_id, user_id=user_id, assumptions=assumptions_for_gate)
+                        if not ok_hist:
+                            st.error("Cannot enqueue forecast until historics import issues are resolved:")
+                            for m in hist_msgs:
+                                st.error(f"- {m}")
+                            return
+                    except Exception:
+                        pass
+
                     run_url = urljoin(api_base_url, "v1/forecasts/run")
                     payload = {
                         "scenario_id": scenario_id,

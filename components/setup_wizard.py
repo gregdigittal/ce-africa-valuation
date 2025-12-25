@@ -655,8 +655,22 @@ def render_step_historics(db, scenario_id: str, user_id: str):
             missing = [m for m in months if m not in have]
             if missing:
                 st.warning(f"Missing IS months in DB: {', '.join([m.strftime('%Y-%m') for m in missing])}")
-            if (view.get("revenue", 0.0) == 0).any():
-                st.warning("Some IS months have zero revenue totals (check mapping/category labels in the import).")
+            # If 'revenue' bucket is missing entirely, DataFrame.get would return a scalar default,
+            # and calling .any() would fail. Guard for missing column and provide a clearer message.
+            rev_series = view.get("revenue")  # Series or None
+            if rev_series is None:
+                st.warning(
+                    "No **revenue** bucket detected in the Income Statement summary (check category/line item labels in the import)."
+                )
+            else:
+                try:
+                    if (pd.to_numeric(rev_series, errors="coerce").fillna(0.0) == 0).any():
+                        st.warning(
+                            "Some IS months have zero revenue totals (check mapping/category labels in the import)."
+                        )
+                except Exception:
+                    # Never fail the Historics step due to a diagnostic-only check
+                    pass
         else:
             st.info("No Income Statement line items found for this scenario.")
 

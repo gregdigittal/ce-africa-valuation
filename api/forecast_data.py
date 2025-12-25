@@ -89,6 +89,124 @@ def load_income_statement_history(db, scenario_id: str) -> Tuple[pd.DataFrame, D
     return out, diag
 
 
+def _get_monthly_sales_pattern_api(db, scenario_id: str) -> Optional[np.ndarray]:
+    """
+    API-safe seasonality extraction.
+    Prefers `granular_sales_history` (invoice-level) scoped to the scenario's user_id.
+    Returns 12-element weights that sum to 1.0, or None.
+    """
+    try:
+        scen = db.client.table("scenarios").select("user_id").eq("id", scenario_id).limit(1).execute()
+        scen_user_id = None
+        if scen.data and scen.data[0].get("user_id"):
+            scen_user_id = scen.data[0]["user_id"]
+        if not scen_user_id:
+            return None
+        resp = (
+            db.client.table("granular_sales_history")
+            .select("date, quantity, unit_price_sold")
+            .eq("user_id", scen_user_id)
+            .execute()
+        )
+        rows = resp.data or []
+        if len(rows) < 12:
+            return None
+        sdf = pd.DataFrame(rows)
+        sdf["date"] = pd.to_datetime(sdf["date"], errors="coerce")
+        sdf = sdf.dropna(subset=["date"])
+        if sdf.empty:
+            return None
+        sdf["month"] = sdf["date"].dt.month
+        sdf["quantity"] = pd.to_numeric(sdf.get("quantity"), errors="coerce").fillna(0.0)
+        sdf["unit_price_sold"] = pd.to_numeric(sdf.get("unit_price_sold"), errors="coerce").fillna(0.0)
+        sdf["sales"] = sdf["quantity"] * sdf["unit_price_sold"]
+        monthly = sdf.groupby("month")["sales"].sum()
+        if int((monthly > 0).sum()) < 6:
+            return None
+        pattern = np.zeros(12, dtype=float)
+        for m in range(1, 13):
+            pattern[m - 1] = float(monthly.get(m, 0.0))
+        s = float(pattern.sum())
+        return (pattern / s) if s > 0 else None
+    except Exception:
+        return None
+
+
+def _upsample_annual_or_ytd_is(
+    df: pd.DataFrame,
+    sales_pattern: Optional[np.ndarray],
+    fiscal_year_end_month: int = 12,
+    ytd_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
+) -> pd.DataFrame:
+    """
+    If income statement history has <=1 row per year (annual/YTD), upsample to monthly.
+    If YTD (<12 months covered), annualize to 12 months before splitting (gross-up).
+    """
+    if df.empty or "period_date" not in df.columns:
+        return df
+    df = df.copy()
+    df["period_date"] = pd.to_datetime(df["period_date"], errors="coerce")
+    df = df.dropna(subset=["period_date"])
+    if df.empty:
+        return df
+    counts = df["period_date"].dt.year.value_counts()
+    if counts.max() > 1:
+        return df
+
+    fiscal_year_end_month = int(fiscal_year_end_month or 12)
+    ytd_overrides = ytd_overrides or {}
+
+    def _fy_end_year(dt: pd.Timestamp) -> int:
+        return int(dt.year) if int(dt.month) <= fiscal_year_end_month else int(dt.year) + 1
+
+    if sales_pattern is not None and len(sales_pattern) == 12:
+        s = float(np.sum(sales_pattern))
+        sales_pattern = (sales_pattern / s) if s > 0 else None
+    else:
+        sales_pattern = None
+
+    rows: List[Dict[str, Any]] = []
+    for _, r in df.iterrows():
+        dt = pd.to_datetime(r["period_date"], errors="coerce")
+        if pd.isna(dt):
+            continue
+        fy_end = pd.Timestamp(_fy_end_year(dt), fiscal_year_end_month, 1)
+        fy_start = (fy_end - pd.DateOffset(months=11)).to_period("M").to_timestamp()
+        fy_months = pd.date_range(start=fy_start, periods=12, freq="MS")
+
+        dt_m = dt.to_period("M").to_timestamp()
+        months_covered = int(sum(m <= dt_m for m in fy_months))
+        months_covered = max(1, min(months_covered, 12))
+
+        override = ytd_overrides.get(int(_fy_end_year(dt)))
+        if override and override.get("ytd_end_calendar_month"):
+            cal_m = int(override["ytd_end_calendar_month"])
+            candidate = pd.Timestamp(fy_end.year if cal_m <= fiscal_year_end_month else fy_end.year - 1, cal_m, 1)
+            if candidate in set(fy_months):
+                months_covered = int(list(fy_months).index(candidate)) + 1
+
+        annualize_factor = 12 / months_covered if months_covered < 12 else 1.0
+
+        for m_start in fy_months:
+            if sales_pattern is not None:
+                w = float(sales_pattern[int(m_start.month) - 1])
+            else:
+                w = 1.0 / 12.0
+            new = {"period_date": pd.to_datetime(m_start)}
+            for c in df.columns:
+                if c == "period_date":
+                    continue
+                val = float(r.get(c) or 0.0)
+                new[c] = val * annualize_factor * w
+            rows.append(new)
+
+    if not rows:
+        return df
+    out = pd.DataFrame(rows)
+    out["period_date"] = pd.to_datetime(out["period_date"], errors="coerce")
+    return out.sort_values("period_date")
+
+
 def load_forecast_data_api(
     db,
     scenario_id: str,
@@ -179,6 +297,25 @@ def load_forecast_data_api(
     if bool(data["assumptions"].get("use_trend_forecast")) or data["assumptions"].get("forecast_method") == "trend":
         hist_df, _diag = load_income_statement_history(db, scenario_id)
         if not hist_df.empty:
+            # If annual/YTD-only imports exist, upsample to monthly (gross-up YTD to full year)
+            try:
+                assumptions = data.get("assumptions") or {}
+                ip = (assumptions.get("import_period_settings") or {}) if isinstance(assumptions, dict) else {}
+                fy_end_month = 12
+                ytd_overrides: Dict[int, Dict[str, Any]] = {}
+                if isinstance(ip, dict):
+                    cfg_block = ip.get("historical_income_statement_line_items") or {}
+                    fy_end_month = int(cfg_block.get("fiscal_year_end_month") or fy_end_month)
+                    ytd_cfg = cfg_block.get("ytd") or None
+                    if isinstance(ytd_cfg, dict) and ytd_cfg.get("year"):
+                        ytd_overrides[int(ytd_cfg["year"])] = {
+                            "year_end_month": int(ytd_cfg.get("year_end_month") or fy_end_month),
+                            "ytd_end_calendar_month": int(ytd_cfg.get("ytd_end_calendar_month") or 0) or None,
+                        }
+                pattern = _get_monthly_sales_pattern_api(db, scenario_id)
+                hist_df = _upsample_annual_or_ytd_is(hist_df, pattern, fiscal_year_end_month=fy_end_month, ytd_overrides=ytd_overrides)
+            except Exception:
+                pass
             data["historic_financials"] = hist_df.rename(columns={"period_date": "period_date"})
             # Provide a simple revenue series for legacy paths
             data["historical_revenue"] = hist_df.set_index("period_date")["revenue"].sort_index()
