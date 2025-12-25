@@ -8,6 +8,7 @@ from api.models import ForecastRunRequest, JobStatusResponse, SnapshotGetRespons
 from api.queue import get_queue
 from api.supabase_handler import SupabaseAPIHandler
 from api.tasks import run_forecast_task
+from api.validation import validate_import_coverage
 
 
 app = FastAPI(title="CE Africa Valuation API", version="0.1.0")
@@ -19,12 +20,52 @@ def health() -> dict:
 
 
 @app.post("/v1/forecasts/run")
-def enqueue_forecast(req: ForecastRunRequest) -> dict:
+def enqueue_forecast(req: ForecastRunRequest, request: Request) -> dict:
+    # Determine user context (Authorization preferred; body user_id allowed for dev)
+    effective_user_id = req.user_id
+    try:
+        token = parse_bearer_token(request.headers.get("Authorization"))
+        if token:
+            effective_user_id = verify_supabase_jwt(token).user_id
+            if req.user_id and str(req.user_id) != str(effective_user_id):
+                raise HTTPException(status_code=401, detail="user_id does not match Authorization token")
+    except HTTPException:
+        raise
+    except Exception:
+        if request.headers.get("Authorization"):
+            raise HTTPException(status_code=401, detail="Invalid Authorization token")
+
+    if not effective_user_id:
+        raise HTTPException(status_code=401, detail="Missing user_id (provide Authorization header or user_id in request body)")
+
+    # Hard gate: scenario must belong to user and historics must exist when expected
+    db = SupabaseAPIHandler()
+    try:
+        owner = db.get_scenario_user_id(req.scenario_id)
+        if owner and str(owner) != str(effective_user_id):
+            raise HTTPException(status_code=403, detail="Scenario not accessible for this user")
+    except HTTPException:
+        raise
+    except Exception:
+        # If we can't check owner, continue; RLS should still protect snapshot writes/reads.
+        pass
+
+    try:
+        assumptions = db.get_scenario_assumptions(req.scenario_id, effective_user_id) or {}
+        ok, msgs = validate_import_coverage(db, req.scenario_id, str(effective_user_id), assumptions=assumptions)
+        if not ok:
+            raise HTTPException(status_code=400, detail={"message": "Historics import incomplete", "issues": msgs})
+    except HTTPException:
+        raise
+    except Exception:
+        # If validator fails unexpectedly, don't block job submission
+        pass
+
     q = get_queue("default")
     job = q.enqueue(
         run_forecast_task,
         req.scenario_id,
-        req.user_id,
+        str(effective_user_id),
         req.options,
         job_timeout=60 * 30,  # 30 minutes for now
         result_ttl=60 * 60,   # keep 1 hour

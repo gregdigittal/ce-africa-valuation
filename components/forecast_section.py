@@ -4847,6 +4847,47 @@ Best when you have reliable historical financials and want trend-driven forecast
             st.info("Monte Carlo will be run in the API job and saved into the snapshot.")
         if include_manufacturing:
             st.info("Manufacturing scenario will be passed to the API job (requires it to be configured).")
+
+    # ---------------------------------------------------------------------
+    # Import period settings summary (what months the model expects)
+    # ---------------------------------------------------------------------
+    try:
+        if hasattr(db, "get_scenario_assumptions"):
+            _assum = db.get_scenario_assumptions(scenario_id, user_id) or {}
+        else:
+            _assum = {}
+        ip = (_assum or {}).get("import_period_settings") or {}
+        if isinstance(ip, dict) and ip:
+            with st.expander("📌 Last historics import settings (expected periods)", expanded=False):
+                st.caption("These settings are saved during import and used to validate historics coverage before running forecasts.")
+                for k, label in [
+                    ("historical_income_statement_line_items", "Income Statement"),
+                    ("historical_balance_sheet_line_items", "Balance Sheet"),
+                    ("historical_cashflow_line_items", "Cash Flow"),
+                ]:
+                    blk = ip.get(k) or {}
+                    sel = blk.get("selected_periods") or []
+                    fy_end = blk.get("fiscal_year_end_month")
+                    ytd = blk.get("ytd") or {}
+                    st.markdown(f"**{label}**")
+                    st.write(f"- Selected periods: **{len(sel) if isinstance(sel, list) else 0}**")
+                    if isinstance(sel, list) and sel:
+                        st.write(f"  - Range: `{sel[0]}` → `{sel[-1]}`")
+                    if fy_end:
+                        st.write(f"- Fiscal year-end month: **{int(fy_end)}**")
+                    if isinstance(ytd, dict) and ytd:
+                        try:
+                            y_year = ytd.get("year")
+                            y_end_m = ytd.get("ytd_end_calendar_month")
+                            fill = ytd.get("fill_fy_months") or []
+                            st.write(f"- YTD: **Yes** (FY{y_year}, ends at month {y_end_m}, fill FY months: {fill})")
+                        except Exception:
+                            st.write("- YTD: **Yes**")
+                    else:
+                        st.write("- YTD: **No**")
+                    st.markdown("---")
+    except Exception:
+        pass
     
     # Run buttons
     if exec_mode == "Local (in-app)":
