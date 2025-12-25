@@ -61,10 +61,16 @@ STEPS = [
 # =============================================================================
 
 
-def load_table_data(db, table: str, user_id: str, scenario_id: str = None) -> pd.DataFrame:
-    """Load data from a table."""
+def load_table_data(
+    db, table: str, user_id: str, scenario_id: str = None, columns: Optional[List[str]] = None
+) -> pd.DataFrame:
+    """Load data from a table.
+
+    `columns` can be used to limit payload size (recommended for large line-item tables).
+    """
     try:
-        query = db.client.table(table).select("*")
+        select_cols = "*" if not columns else ",".join(columns)
+        query = db.client.table(table).select(select_cols)
 
         user_only_tables = ["customers", "aged_debtors", "aged_creditors", "wear_profiles"]
 
@@ -530,9 +536,166 @@ def render_step_historics(db, scenario_id: str, user_id: str):
         st.warning("⚠️ Select a scenario to import historical data")
         return
 
-    is_li_df = load_table_data(db, "historical_income_statement_line_items", user_id, scenario_id)
-    bs_li_df = load_table_data(db, "historical_balance_sheet_line_items", user_id, scenario_id)
-    cf_li_df = load_table_data(db, "historical_cashflow_line_items", user_id, scenario_id)
+    # Keep payload small - these tables can get large
+    li_cols = ["period_date", "line_item_name", "category", "sub_category", "amount"]
+    is_li_df = load_table_data(db, "historical_income_statement_line_items", user_id, scenario_id, columns=li_cols)
+    bs_li_df = load_table_data(db, "historical_balance_sheet_line_items", user_id, scenario_id, columns=li_cols)
+    cf_li_df = load_table_data(db, "historical_cashflow_line_items", user_id, scenario_id, columns=li_cols)
+
+    def _month_range(min_dt: pd.Timestamp, max_dt: pd.Timestamp) -> List[pd.Timestamp]:
+        if pd.isna(min_dt) or pd.isna(max_dt):
+            return []
+        min_dt = pd.Timestamp(min_dt).to_period("M").to_timestamp()
+        max_dt = pd.Timestamp(max_dt).to_period("M").to_timestamp()
+        return list(pd.date_range(min_dt, max_dt, freq="MS"))
+
+    def _bucketize_is(category: str, line_item: str) -> str:
+        c = (category or "").strip().lower()
+        li = (line_item or "").strip().lower()
+        s = f"{c} {li}".strip()
+        if any(k in s for k in ["revenue", "rev", "sales", "turnover"]):
+            return "revenue"
+        if any(k in s for k in ["cogs", "cost of sales", "cost_of_sales", "costs of sales", "direct cost"]):
+            return "cogs"
+        if any(k in s for k in ["opex", "operating expense", "operating expenses", "overhead", "sg&a", "sga"]):
+            return "opex"
+        if any(k in s for k in ["depreciation", "amortization"]):
+            return "depr_amort"
+        if any(k in s for k in ["interest"]):
+            return "interest"
+        if any(k in s for k in ["tax"]):
+            return "tax"
+        if any(k in s for k in ["other income"]):
+            return "other_income"
+        if any(k in s for k in ["other expense"]):
+            return "other_expense"
+        return "other"
+
+    def _bucketize_cf(category: str, line_item: str) -> str:
+        c = (category or "").strip().lower()
+        li = (line_item or "").strip().lower()
+        s = f"{c} {li}".strip()
+        if any(k in s for k in ["operating", "operations", "cfo"]):
+            return "operating"
+        if any(k in s for k in ["investing", "cfi", "capex", "capital"]):
+            return "investing"
+        if any(k in s for k in ["financing", "cff", "debt", "equity", "dividend"]):
+            return "financing"
+        return "other"
+
+    def _bucketize_bs(category: str, line_item: str) -> str:
+        c = (category or "").strip().lower()
+        li = (line_item or "").strip().lower()
+        s = f"{c} {li}".strip()
+        if "asset" in s:
+            return "assets"
+        if any(k in s for k in ["liabil", "payable", "debt"]):
+            return "liabilities"
+        if any(k in s for k in ["equity", "retained", "share capital"]):
+            return "equity"
+        return "other"
+
+    def _summarize_line_items(df: pd.DataFrame, statement: str) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame()
+        work = df.copy()
+        if "period_date" not in work.columns or "amount" not in work.columns:
+            return pd.DataFrame()
+        work["period_date"] = pd.to_datetime(work["period_date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+        work["amount"] = pd.to_numeric(work["amount"], errors="coerce").fillna(0.0)
+        work["category"] = work.get("category", "").fillna("").astype(str)
+        work["line_item_name"] = work.get("line_item_name", "").fillna("").astype(str)
+
+        if statement == "income_statement":
+            work["bucket"] = [
+                _bucketize_is(c, li) for c, li in zip(work["category"].tolist(), work["line_item_name"].tolist())
+            ]
+        elif statement == "cash_flow":
+            work["bucket"] = [
+                _bucketize_cf(c, li) for c, li in zip(work["category"].tolist(), work["line_item_name"].tolist())
+            ]
+        elif statement == "balance_sheet":
+            work["bucket"] = [
+                _bucketize_bs(c, li) for c, li in zip(work["category"].tolist(), work["line_item_name"].tolist())
+            ]
+        else:
+            return pd.DataFrame()
+
+        pivot = (
+            work.groupby(["period_date", "bucket"], dropna=False)["amount"]
+            .sum()
+            .unstack("bucket", fill_value=0.0)
+            .reset_index()
+            .sort_values("period_date")
+        )
+        return pivot
+
+    with st.expander("✅ Post-import integrity check (recommended before forecasting)", expanded=False):
+        st.caption(
+            "This reads what is currently in Supabase and summarizes monthly totals + flags missing months. "
+            "Use it to validate imports before running the model."
+        )
+        if st.button("🔄 Refresh from DB", key="historics_refresh_db"):
+            st.rerun()
+
+        is_sum = _summarize_line_items(is_li_df, "income_statement")
+        bs_sum = _summarize_line_items(bs_li_df, "balance_sheet")
+        cf_sum = _summarize_line_items(cf_li_df, "cash_flow")
+
+        if not is_sum.empty:
+            cols = ["period_date"] + [c for c in ["revenue", "cogs", "opex", "depr_amort", "interest", "tax"] if c in is_sum.columns]
+            view = is_sum[cols].copy()
+            view["gross_profit"] = view.get("revenue", 0.0) - view.get("cogs", 0.0)
+            view["ebit"] = view["gross_profit"] - view.get("opex", 0.0) - view.get("depr_amort", 0.0)
+            st.markdown("**Income Statement (monthly totals)**")
+            st.dataframe(view, use_container_width=True, hide_index=True)
+
+            months = _month_range(is_sum["period_date"].min(), is_sum["period_date"].max())
+            have = set(is_sum["period_date"].tolist())
+            missing = [m for m in months if m not in have]
+            if missing:
+                st.warning(f"Missing IS months in DB: {', '.join([m.strftime('%Y-%m') for m in missing])}")
+            if (view.get("revenue", 0.0) == 0).any():
+                st.warning("Some IS months have zero revenue totals (check mapping/category labels in the import).")
+        else:
+            st.info("No Income Statement line items found for this scenario.")
+
+        st.markdown("---")
+
+        if not bs_sum.empty:
+            st.markdown("**Balance Sheet (bucket totals)**")
+            bs_view_cols = ["period_date"] + [c for c in ["assets", "liabilities", "equity"] if c in bs_sum.columns]
+            bs_view = bs_sum[bs_view_cols].copy()
+            if "assets" in bs_view.columns and "liabilities" in bs_view.columns and "equity" in bs_view.columns:
+                bs_view["balance_check"] = bs_view["assets"] - (bs_view["liabilities"] + bs_view["equity"])
+            st.dataframe(bs_view, use_container_width=True, hide_index=True)
+
+            months = _month_range(bs_sum["period_date"].min(), bs_sum["period_date"].max())
+            have = set(bs_sum["period_date"].tolist())
+            missing = [m for m in months if m not in have]
+            if missing:
+                st.warning(f"Missing BS months in DB: {', '.join([m.strftime('%Y-%m') for m in missing])}")
+        else:
+            st.info("No Balance Sheet line items found for this scenario.")
+
+        st.markdown("---")
+
+        if not cf_sum.empty:
+            st.markdown("**Cash Flow (bucket totals)**")
+            cf_view_cols = ["period_date"] + [c for c in ["operating", "investing", "financing"] if c in cf_sum.columns]
+            cf_view = cf_sum[cf_view_cols].copy()
+            cf_view["net_cash_flow"] = (
+                cf_view.get("operating", 0.0) + cf_view.get("investing", 0.0) + cf_view.get("financing", 0.0)
+            )
+            st.dataframe(cf_view, use_container_width=True, hide_index=True)
+
+            months = _month_range(cf_sum["period_date"].min(), cf_sum["period_date"].max())
+            have = set(cf_sum["period_date"].tolist())
+            missing = [m for m in months if m not in have]
+            if missing:
+                st.warning(f"Missing CF months in DB: {', '.join([m.strftime('%Y-%m') for m in missing])}")
+        else:
+            st.info("No Cash Flow line items found for this scenario.")
 
     col1, col2, col3 = st.columns(3)
     with col1:
