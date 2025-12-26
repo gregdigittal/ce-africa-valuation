@@ -6,7 +6,8 @@
 CREATE TABLE IF NOT EXISTS forecast_income_statement_line_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     scenario_id UUID NOT NULL REFERENCES scenarios(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    -- NOTE: No FK to auth.users to allow dev mode (nil UUID) and service-role inserts.
+    user_id UUID NOT NULL,
     snapshot_id UUID REFERENCES forecast_snapshots(id) ON DELETE CASCADE,
     period_date DATE NOT NULL,
     line_item_name TEXT NOT NULL,
@@ -24,7 +25,8 @@ CREATE TABLE IF NOT EXISTS forecast_income_statement_line_items (
 CREATE TABLE IF NOT EXISTS forecast_balance_sheet_line_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     scenario_id UUID NOT NULL REFERENCES scenarios(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    -- NOTE: No FK to auth.users to allow dev mode (nil UUID) and service-role inserts.
+    user_id UUID NOT NULL,
     snapshot_id UUID REFERENCES forecast_snapshots(id) ON DELETE CASCADE,
     period_date DATE NOT NULL,
     line_item_name TEXT NOT NULL,
@@ -42,7 +44,8 @@ CREATE TABLE IF NOT EXISTS forecast_balance_sheet_line_items (
 CREATE TABLE IF NOT EXISTS forecast_cashflow_line_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     scenario_id UUID NOT NULL REFERENCES scenarios(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    -- NOTE: No FK to auth.users to allow dev mode (nil UUID) and service-role inserts.
+    user_id UUID NOT NULL,
     snapshot_id UUID REFERENCES forecast_snapshots(id) ON DELETE CASCADE,
     period_date DATE NOT NULL,
     line_item_name TEXT NOT NULL,

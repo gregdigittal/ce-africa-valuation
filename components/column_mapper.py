@@ -1721,14 +1721,36 @@ def process_import(
         status.empty()
         return stats
 
+    # Some deployments may not have the expected UNIQUE constraint backing an ON CONFLICT clause.
+    # Postgres will error with: 42P10 "there is no unique or exclusion constraint matching..."
+    # In that case we fall back to insert for the remainder of the import.
+    force_insert = False
+
+    def _is_on_conflict_constraint_missing(err: Exception) -> bool:
+        msg = str(err).lower()
+        return ("42p10" in msg) or ("no unique or exclusion constraint" in msg and "on conflict" in msg)
+
+    def _write_payload(payload):
+        """Write payload using upsert when possible; fall back to insert if ON CONFLICT isn't supported."""
+        nonlocal force_insert, on_conflict
+        if on_conflict and not force_insert:
+            try:
+                db.client.table(table).upsert(payload, on_conflict=on_conflict).execute()
+                return
+            except Exception as e:
+                # Missing UNIQUE constraint for the specified conflict target (common on early migrations)
+                if _is_on_conflict_constraint_missing(e):
+                    force_insert = True
+                    on_conflict = None
+                    db.client.table(table).insert(payload).execute()
+                    return
+                raise
+        db.client.table(table).insert(payload).execute()
+
     def _write_chunk(records_chunk: List[Tuple[int, Dict[str, Any]]]) -> None:
         """Write a chunk; raise on failure."""
         payload = [r for (_row_num, r) in records_chunk]
-        if on_conflict:
-            db.client.table(table).upsert(payload, on_conflict=on_conflict).execute()
-        else:
-            # Default: insert (fastest). If duplicates occur, fallback is handled outside.
-            db.client.table(table).insert(payload).execute()
+        _write_payload(payload)
 
     def _is_transient_supabase_error(err: Exception) -> bool:
         """
@@ -1834,25 +1856,7 @@ def process_import(
             # Slow fallback: attempt row-by-row within this chunk to isolate failing rows
             for row_num, record in chunk:
                 try:
-                    if on_conflict:
-                        _exec_with_retries(
-                            lambda: db.client.table(table).upsert(record, on_conflict=on_conflict).execute(),
-                            attempts=3
-                        )
-                    else:
-                        try:
-                            _exec_with_retries(
-                                lambda: db.client.table(table).insert(record).execute(),
-                                attempts=3
-                            )
-                        except Exception as insert_err:
-                            if 'duplicate' in str(insert_err).lower() or '23505' in str(insert_err):
-                                _exec_with_retries(
-                                    lambda: db.client.table(table).upsert(record).execute(),
-                                    attempts=3
-                                )
-                            else:
-                                raise
+                    _exec_with_retries(lambda: _write_payload(record), attempts=3)
                     stats['success'] += 1
                 except Exception as row_err:
                     stats['failed'] += 1

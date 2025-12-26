@@ -42,7 +42,10 @@ class ForecastEngine:
     
     def __init__(self):
         """Initialize the forecast engine."""
-        pass
+        # Lightweight diagnostics captured during a run (for UI explainability).
+        self._last_opex_diag: Dict[str, Any] = {}
+        self._last_cogs_diag: Dict[str, Any] = {}
+        self._last_margin_diag: Dict[str, Any] = {}
     
     def run_forecast(
         self,
@@ -485,6 +488,45 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
                 data.get('prospects', []), n_months, inflation, start_date
             )
             total_rev = consumable_rev + refurb_rev + pipeline_rev
+
+        # ======================================================================
+        # Guardrail: First forecast-year revenue should not be below latest actual
+        # unless user explicitly sets a lower floor.
+        # ======================================================================
+        try:
+            consumable_rev, refurb_rev, pipeline_rev, total_rev, floor_diag = self._apply_first_forecast_year_revenue_floor(
+                timeline=timeline,
+                consumable_rev=consumable_rev,
+                refurb_rev=refurb_rev,
+                pipeline_rev=pipeline_rev,
+                total_rev=total_rev,
+                data=data,
+                assumptions=assumptions,
+            )
+            if isinstance(floor_diag, dict) and floor_diag.get("applied"):
+                results["first_forecast_year_revenue_floor"] = floor_diag
+        except Exception:
+            # Never fail forecasting due to a guardrail calculation.
+            pass
+
+        # ======================================================================
+        # Guardrail: Existing customer (fleet) revenue should not decline YoY.
+        # This prevents the common case where FY1 is uplifted to match actuals
+        # but subsequent years revert to an underspecified wear-profile baseline.
+        # ======================================================================
+        try:
+            consumable_rev, refurb_rev, total_rev, ex_diag = self._apply_existing_customer_revenue_growth_floor(
+                timeline=timeline,
+                consumable_rev=consumable_rev,
+                refurb_rev=refurb_rev,
+                pipeline_rev=pipeline_rev,
+                total_rev=total_rev,
+                assumptions=assumptions,
+            )
+            if isinstance(ex_diag, dict) and ex_diag.get("applied"):
+                results["existing_customer_revenue_floor"] = ex_diag
+        except Exception:
+            pass
         
         if progress_callback:
             progress_callback(0.6, "Calculating costs...")
@@ -545,7 +587,12 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
         else:
             # Use default calculation
             opex = self._calculate_opex(
-                data.get('expenses', []), total_rev, cogs_data['cogs'], n_months
+                data.get('expenses', []),
+                total_rev,
+                cogs_data['cogs'],
+                n_months,
+                assumptions=assumptions,
+                data=data,
             )
         
         if progress_callback:
@@ -554,6 +601,41 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
         # Calculate profits
         gross_profit = total_rev - cogs_data['cogs']
         ebit = gross_profit - opex
+
+        # Attach diagnostics (best-effort; never fail the run)
+        try:
+            results.setdefault("calculation_meta", {})
+            results["calculation_meta"]["forecast_method"] = forecast_method
+            results["calculation_meta"]["use_trend_forecast"] = bool(use_trend_forecast)
+            results["calculation_meta"]["inflation_rate_used"] = float(inflation)
+            results["calculation_meta"]["margin_consumable"] = float(margin_consumable)
+            results["calculation_meta"]["margin_refurb"] = float(margin_refurb)
+            if isinstance(margin_source_c, str):
+                results["calculation_meta"]["margin_consumable_source"] = margin_source_c
+            if isinstance(margin_source_r, str):
+                results["calculation_meta"]["margin_refurb_source"] = margin_source_r
+
+            # COGS source
+            if forecast_configs and cogs_config_key:
+                cfg = forecast_configs.get(cogs_config_key, {}) if isinstance(forecast_configs, dict) else {}
+                results["calculation_meta"]["cogs_method"] = f"forecast_config:{cfg.get('method', 'unknown')}"
+            else:
+                results["calculation_meta"]["cogs_method"] = "margins"
+
+            # OPEX source
+            if forecast_configs and opex_config_key:
+                cfg = forecast_configs.get(opex_config_key, {}) if isinstance(forecast_configs, dict) else {}
+                results["calculation_meta"]["opex_method"] = f"forecast_config:{cfg.get('method', 'unknown')}"
+            else:
+                # from _calculate_opex diagnostics if present
+                if isinstance(getattr(self, "_last_opex_diag", None), dict) and self._last_opex_diag:
+                    results["calculation_meta"]["opex_method"] = self._last_opex_diag.get("mode")
+                    results["calculation_meta"]["opex_pct_floor"] = self._last_opex_diag.get("pct_floor")
+                    results["calculation_meta"]["opex_pct_source"] = self._last_opex_diag.get("pct_source")
+                    results["calculation_meta"]["expense_items"] = self._last_opex_diag.get("expense_items")
+                    results["calculation_meta"]["looks_like_setup_defaults"] = self._last_opex_diag.get("looks_like_setup_defaults")
+        except Exception:
+            pass
         
         # Store results
         results = self._store_results(
@@ -618,10 +700,28 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
         default: float
     ) -> tuple:
         """Get effective margin from AI assumptions with fallback."""
-        # This is a simplified version - full implementation would use get_effective_assumption
-        # For now, prioritize manual assumptions, then AI, then default
+        # For now: prioritize manual assumptions, then AI, then default.
+        # IMPORTANT: support both legacy/manual keys:
+        # - margin_consumable_pct / margin_refurb_pct
+        # - gross_margin_liner / gross_margin_refurb (often saved by UI/AI)
         margin = assumptions.get(manual_key)
         source = 'Manual'
+
+        if margin is None or margin == 0:
+            # Try alternate manual keys
+            alt_keys = [ai_key]
+            # If AI produced an overall gross margin, use it when segment-specific key is missing.
+            if str(ai_key).startswith("gross_margin"):
+                alt_keys.append("gross_margin_pct")
+            for k in alt_keys:
+                try:
+                    v = assumptions.get(k)
+                    if v is not None and v != 0:
+                        margin = v
+                        source = "Manual"
+                        break
+                except Exception:
+                    continue
         
         if margin is None or margin == 0:
             # Try AI assumptions
@@ -629,6 +729,9 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
                 try:
                     if hasattr(ai_assumptions, 'assumptions'):
                         ai_assum = ai_assumptions.assumptions.get(ai_key)
+                        # Fallback to overall margin if present
+                        if not ai_assum and str(ai_key).startswith("gross_margin"):
+                            ai_assum = ai_assumptions.assumptions.get("gross_margin_pct")
                         if ai_assum:
                             margin = ai_assum.final_static_value if hasattr(ai_assum, 'final_static_value') else ai_assum
                             source = 'AI'
@@ -726,6 +829,298 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
                 pipeline_rev[month_idx] += monthly_rev * inflation_factor
         
         return pipeline_rev
+
+    def _apply_first_forecast_year_revenue_floor(
+        self,
+        *,
+        timeline: pd.DatetimeIndex,
+        consumable_rev: np.ndarray,
+        refurb_rev: np.ndarray,
+        pipeline_rev: np.ndarray,
+        total_rev: np.ndarray,
+        data: Dict[str, Any],
+        assumptions: Dict[str, Any],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+        """
+        Enforce: first forecast-year total revenue should not be less than the latest
+        actual year's revenue, unless the user manually sets a lower floor.
+
+        Implementation:
+        - Compute latest actual-year revenue from imported history.
+        - Determine the first forecast calendar year after that, within the forecast horizon.
+        - If forecast total for that year is below the floor, add an "uplift" allocated
+          into consumables/refurb (keeps pipeline unchanged) so margins logic still works.
+        """
+        diag: Dict[str, Any] = {"applied": False}
+
+        enforce = assumptions.get("enforce_first_forecast_year_revenue_floor", True)
+        if isinstance(enforce, str):
+            enforce = enforce.strip().lower() not in ("0", "false", "no", "off")
+        if not bool(enforce):
+            diag["reason"] = "disabled"
+            return consumable_rev, refurb_rev, pipeline_rev, total_rev, diag
+
+        manual_floor = assumptions.get("first_forecast_year_revenue_floor", None)
+        try:
+            manual_floor = float(manual_floor) if manual_floor is not None and manual_floor != "" else None
+        except Exception:
+            manual_floor = None
+
+        # Load historical financials (prefer aggregated loader output)
+        hist = data.get("historical_financials")
+        if hist is None or not isinstance(hist, pd.DataFrame) or hist.empty:
+            hist = data.get("historic_financials")
+        if hist is None or not isinstance(hist, pd.DataFrame) or hist.empty:
+            diag["reason"] = "no_historical_data"
+            return consumable_rev, refurb_rev, pipeline_rev, total_rev, diag
+
+        # Identify date + revenue columns
+        date_col = "period_date" if "period_date" in hist.columns else ("month" if "month" in hist.columns else None)
+        rev_col = "total_revenue" if "total_revenue" in hist.columns else ("revenue" if "revenue" in hist.columns else None)
+        if not date_col or not rev_col:
+            diag["reason"] = "missing_columns"
+            diag["missing"] = {"date_col": date_col, "rev_col": rev_col}
+            return consumable_rev, refurb_rev, pipeline_rev, total_rev, diag
+
+        h = hist.copy()
+        h[date_col] = pd.to_datetime(h[date_col], errors="coerce")
+        h = h.dropna(subset=[date_col])
+        if h.empty:
+            diag["reason"] = "no_valid_dates"
+            return consumable_rev, refurb_rev, pipeline_rev, total_rev, diag
+
+        # Prefer is_actual rows when available
+        if "is_actual" in h.columns:
+            try:
+                mask = h["is_actual"].astype(bool)
+                if mask.any():
+                    h = h[mask]
+            except Exception:
+                pass
+
+        h[rev_col] = pd.to_numeric(h[rev_col], errors="coerce").fillna(0.0)
+        # Keep only non-trivial revenue rows for determining "latest" year
+        # (still allows 0-revenue years to be excluded from floor)
+        nonzero = h[h[rev_col].abs() > 0]
+        if nonzero.empty:
+            diag["reason"] = "no_nonzero_revenue"
+            return consumable_rev, refurb_rev, pipeline_rev, total_rev, diag
+
+        last_actual_year = int(nonzero[date_col].dt.year.max())
+        year_df = h[h[date_col].dt.year == last_actual_year]
+        months_in_year = int(year_df[date_col].dt.month.nunique()) if not year_df.empty else 0
+        last_year_sum = float(year_df[rev_col].sum()) if not year_df.empty else 0.0
+
+        # Annualize when partial year (common when latest actuals are YTD)
+        if months_in_year and months_in_year < 12:
+            last_year_annualized = last_year_sum * (12.0 / float(months_in_year))
+        else:
+            last_year_annualized = last_year_sum
+
+        floor_value = float(manual_floor) if manual_floor is not None else float(last_year_annualized)
+        if floor_value < 0:
+            # Negative floors don't make sense for revenue; treat as disabled.
+            diag["reason"] = "invalid_floor_value"
+            diag["floor_value"] = floor_value
+            return consumable_rev, refurb_rev, pipeline_rev, total_rev, diag
+
+        # Determine the first forecast year after the latest actual year within this horizon
+        forecast_years = sorted(set(pd.to_datetime(timeline).year.tolist()))
+        future_years = [y for y in forecast_years if int(y) > int(last_actual_year)]
+        if not future_years:
+            diag["reason"] = "no_forecast_year_after_actual"
+            diag["last_actual_year"] = last_actual_year
+            diag["forecast_years"] = forecast_years
+            return consumable_rev, refurb_rev, pipeline_rev, total_rev, diag
+
+        first_forecast_year = int(future_years[0])
+        year_mask = (pd.to_datetime(timeline).year == first_forecast_year)
+        idxs = np.where(year_mask)[0]
+        if idxs.size == 0:
+            diag["reason"] = "no_months_in_first_forecast_year"
+            return consumable_rev, refurb_rev, pipeline_rev, total_rev, diag
+
+        current_year_total = float(np.sum(total_rev[idxs]))
+
+        # If horizon includes only part of the year, floor proportionally.
+        target_total = float(floor_value) * (float(idxs.size) / 12.0) if idxs.size < 12 else float(floor_value)
+
+        if current_year_total >= target_total:
+            diag.update(
+                {
+                    "applied": False,
+                    "last_actual_year": last_actual_year,
+                    "last_actual_year_sum": last_year_sum,
+                    "last_actual_year_months": months_in_year,
+                    "last_actual_year_annualized": float(last_year_annualized),
+                    "first_forecast_year": first_forecast_year,
+                    "current_forecast_year_total": current_year_total,
+                    "target_floor_total": target_total,
+                    "manual_floor": manual_floor,
+                }
+            )
+            return consumable_rev, refurb_rev, pipeline_rev, total_rev, diag
+
+        uplift_total = target_total - current_year_total
+
+        # Allocate uplift across months based on existing (fleet) pattern; fall back to equal weights.
+        base_existing = (consumable_rev + refurb_rev)[idxs]
+        base_sum = float(np.sum(base_existing))
+        if base_sum > 0:
+            weights = base_existing / (base_sum + 1e-12)
+        else:
+            weights = np.ones(idxs.size, dtype=float) / float(idxs.size)
+
+        # Default split when existing is zero for a month
+        default_cons_share = 0.70
+        default_ref_share = 0.30
+
+        for j, idx in enumerate(idxs.tolist()):
+            uplift_m = float(uplift_total) * float(weights[j])
+            denom = float(consumable_rev[idx] + refurb_rev[idx])
+            if denom > 0:
+                cons_share = float(consumable_rev[idx] / denom)
+                ref_share = float(refurb_rev[idx] / denom)
+            else:
+                cons_share = default_cons_share
+                ref_share = default_ref_share
+
+            consumable_rev[idx] = float(consumable_rev[idx]) + uplift_m * cons_share
+            refurb_rev[idx] = float(refurb_rev[idx]) + uplift_m * ref_share
+
+        total_rev = consumable_rev + refurb_rev + pipeline_rev
+
+        diag.update(
+            {
+                "applied": True,
+                "last_actual_year": last_actual_year,
+                "last_actual_year_sum": last_year_sum,
+                "last_actual_year_months": months_in_year,
+                "last_actual_year_annualized": float(last_year_annualized),
+                "first_forecast_year": first_forecast_year,
+                "current_forecast_year_total": current_year_total,
+                "target_floor_total": target_total,
+                "uplift_added_total": float(uplift_total),
+                "manual_floor": manual_floor,
+            }
+        )
+        return consumable_rev, refurb_rev, pipeline_rev, total_rev, diag
+
+    def _apply_existing_customer_revenue_growth_floor(
+        self,
+        *,
+        timeline: pd.DatetimeIndex,
+        consumable_rev: np.ndarray,
+        refurb_rev: np.ndarray,
+        pipeline_rev: np.ndarray,
+        total_rev: np.ndarray,
+        assumptions: Dict[str, Any],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+        """
+        Enforce a minimum year-on-year growth (or non-decline) for existing customer revenue.
+
+        We treat "existing customers revenue" as the installed-base/fleet component:
+          existing = consumables + refurb
+
+        Default behavior:
+        - Enabled by default
+        - Uses inflation as the minimum growth rate (so existing revenue is at least inflationary)
+
+        This helps when wear profiles are incomplete/understated and would otherwise cause
+        implausible step-downs after applying first-year floor constraints.
+        """
+        diag: Dict[str, Any] = {"applied": False}
+
+        enabled = assumptions.get("enforce_existing_customer_revenue_floor", True)
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() not in ("0", "false", "no", "off")
+        if not bool(enabled):
+            diag["reason"] = "disabled"
+            return consumable_rev, refurb_rev, total_rev, diag
+
+        # Minimum YoY growth rate (percent or decimal). Default = inflation.
+        growth_raw = assumptions.get("existing_customer_min_growth_pct", None)
+        if growth_raw is None or growth_raw == "":
+            growth_raw = assumptions.get("inflation_rate", 0) or 0
+        try:
+            g = float(growth_raw)
+        except Exception:
+            g = 0.0
+        if g > 1.01:
+            g = g / 100.0
+        g = float(max(g, 0.0))
+
+        years = np.array(pd.to_datetime(timeline).year, dtype=int)
+        uniq_years = sorted(set(int(y) for y in years.tolist()))
+        if len(uniq_years) < 2:
+            diag["reason"] = "single_year_horizon"
+            return consumable_rev, refurb_rev, total_rev, diag
+
+        applied_steps = []
+        existing = consumable_rev + refurb_rev
+
+        for i in range(1, len(uniq_years)):
+            y_prev = int(uniq_years[i - 1])
+            y_cur = int(uniq_years[i])
+            idx_prev = np.where(years == y_prev)[0]
+            idx_cur = np.where(years == y_cur)[0]
+            if idx_prev.size == 0 or idx_cur.size == 0:
+                continue
+
+            prev_sum = float(np.sum(existing[idx_prev]))
+            cur_sum = float(np.sum(existing[idx_cur]))
+            prev_months = float(idx_prev.size)
+            cur_months = float(idx_cur.size)
+            if prev_months <= 0 or cur_months <= 0:
+                continue
+
+            prev_annual = prev_sum * (12.0 / prev_months)
+            cur_annual = cur_sum * (12.0 / cur_months)
+            min_annual = prev_annual * (1.0 + g)
+            if cur_annual >= min_annual:
+                continue
+
+            target_sum = min_annual * (cur_months / 12.0)
+
+            # Scale consumables+refurb within the year to meet target.
+            if cur_sum > 0:
+                factor = target_sum / cur_sum
+                consumable_rev[idx_cur] = consumable_rev[idx_cur] * factor
+                refurb_rev[idx_cur] = refurb_rev[idx_cur] * factor
+            else:
+                # No base existing revenue: allocate target evenly using prior-year mix.
+                prev_cons = float(np.sum(consumable_rev[idx_prev]))
+                prev_ref = float(np.sum(refurb_rev[idx_prev]))
+                denom = prev_cons + prev_ref
+                cons_share = (prev_cons / denom) if denom > 0 else 0.70
+                ref_share = 1.0 - cons_share
+                per_month = target_sum / cur_months
+                consumable_rev[idx_cur] = per_month * cons_share
+                refurb_rev[idx_cur] = per_month * ref_share
+
+            # Update existing for subsequent comparisons
+            existing = consumable_rev + refurb_rev
+            applied_steps.append(
+                {
+                    "year": y_cur,
+                    "prev_year": y_prev,
+                    "prev_annual": prev_annual,
+                    "cur_annual_before": cur_annual,
+                    "target_annual": min_annual,
+                    "growth_floor": g,
+                }
+            )
+
+        total_rev = consumable_rev + refurb_rev + pipeline_rev
+
+        if applied_steps:
+            diag["applied"] = True
+            diag["min_growth_rate"] = g
+            diag["steps"] = applied_steps[:10]
+        else:
+            diag["reason"] = "already_meets_floor"
+
+        return consumable_rev, refurb_rev, total_rev, diag
     
     def _generate_forecast_from_config(
         self,
@@ -1020,7 +1415,13 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
         # Base COGS calculation
         cogs_consumable = consumable_rev * (1 - margin_consumable)
         cogs_refurb = refurb_rev * (1 - margin_refurb)
-        blended_margin = (margin_consumable + margin_refurb) / 2
+        # Pipeline margin: use the *same* blended margin as the existing (fleet) mix by month.
+        # This prevents unintended gross margin drift as pipeline share changes.
+        base_fleet_rev = consumable_rev + refurb_rev
+        denom = np.where(base_fleet_rev > 0, base_fleet_rev, 1.0)
+        cons_share = np.where(base_fleet_rev > 0, consumable_rev / denom, 0.70)
+        ref_share = np.where(base_fleet_rev > 0, refurb_rev / denom, 0.30)
+        blended_margin = cons_share * float(margin_consumable) + ref_share * float(margin_refurb)
         cogs_pipeline = pipeline_rev * (1 - blended_margin)
         base_cogs = cogs_consumable + cogs_refurb + cogs_pipeline
         
@@ -1154,13 +1555,36 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
         expenses: List[Dict],
         total_rev: np.ndarray,
         cogs: np.ndarray,
-        n_months: int
+        n_months: int,
+        *,
+        assumptions: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
         """Calculate operating expenses."""
         opex = np.zeros(n_months)
+        diag: Dict[str, Any] = {
+            "mode": "",
+            "expense_items": 0,
+            "used_pct_floor": False,
+            "pct_floor": None,
+            "pct_source": None,
+            "baseline_total_opex": None,
+            "expense_total_opex": None,
+            "looks_like_setup_defaults": False,
+        }
         
-        if expenses:
-            for expense in expenses:
+        # Prefer explicit expense assumptions if present
+        active_expenses = [e for e in (expenses or []) if e and e.get('is_active', True)]
+        diag["expense_items"] = int(len(active_expenses))
+        try:
+            default_codes = {"personnel", "logistics", "professional", "facilities", "marketing"}
+            codes = {str(e.get("expense_code", "") or "").strip().lower() for e in active_expenses}
+            diag["looks_like_setup_defaults"] = bool(default_codes.issubset(codes)) if codes else False
+        except Exception:
+            pass
+
+        if active_expenses:
+            for expense in active_expenses:
                 if not expense.get('is_active', True):
                     continue
                 
@@ -1191,7 +1615,126 @@ Please configure the trend forecast properly in AI Assumptions → Trend Forecas
                         step_amount = expense.get('step_amount', 50000) or 50000
                         steps = int(total_rev[month_idx] / threshold) if threshold > 0 else 0
                         opex[month_idx] += base * inflation_factor + (steps * step_amount)
-        
+
+        # Baseline OPEX as % of revenue (used as fallback AND as a floor when expense assumptions are incomplete).
+        pct = None
+        pct_source = None
+        try:
+            if isinstance(assumptions, dict):
+                pct = (
+                    assumptions.get('opex_as_pct_revenue')
+                    or assumptions.get('opex_pct_revenue')
+                    or assumptions.get('opex_pct')
+                    or assumptions.get('opex_pct_of_revenue')  # some AI/legacy paths use this name
+                )
+            try:
+                pct = float(pct) if pct is not None and pct != "" else None
+                pct_source = "manual" if pct is not None else None
+            except Exception:
+                pct = None
+                pct_source = None
+
+            if pct is not None and pct > 1.01:
+                pct = pct / 100.0
+
+            # Derive from AI assumptions if missing (common: opex_pct_of_revenue)
+            if (pct is None or pct <= 0) and isinstance(data, dict):
+                ai = data.get("ai_assumptions")
+                try:
+                    if ai and hasattr(ai, "assumptions_saved") and ai.assumptions_saved and hasattr(ai, "assumptions"):
+                        for k in ["opex_pct_of_revenue", "opex_pct_revenue", "opex_as_pct_revenue"]:
+                            if k in ai.assumptions:
+                                a = ai.assumptions[k]
+                                v = a.final_static_value if hasattr(a, "final_static_value") else a
+                                v = float(v)
+                                if v > 1.01:
+                                    v = v / 100.0
+                                if v > 0:
+                                    pct = float(np.clip(v, 0.0, 1.0))
+                                    pct_source = f"ai:{k}"
+                                    break
+                except Exception:
+                    pass
+
+            # Derive from historicals if still missing
+            if pct is None or pct <= 0:
+                hist = None
+                if isinstance(data, dict):
+                    hist = data.get('historic_financials')
+                    if hist is None or (isinstance(hist, pd.DataFrame) and hist.empty):
+                        hist = data.get('historical_financials')
+                if isinstance(hist, pd.DataFrame) and not hist.empty:
+                    rev_col = 'revenue' if 'revenue' in hist.columns else ('total_revenue' if 'total_revenue' in hist.columns else None)
+                    opx_col = 'opex' if 'opex' in hist.columns else ('total_opex' if 'total_opex' in hist.columns else None)
+                    if rev_col and opx_col:
+                        h = hist.copy()
+                        h[rev_col] = pd.to_numeric(h[rev_col], errors='coerce').fillna(0.0)
+                        h[opx_col] = pd.to_numeric(h[opx_col], errors='coerce').fillna(0.0).abs()
+                        h = h[h[rev_col].abs() > 0]
+                        if not h.empty:
+                            # Use latest 12 months for stability
+                            if 'period_date' in h.columns:
+                                h['period_date'] = pd.to_datetime(h['period_date'], errors='coerce')
+                                h = h.dropna(subset=['period_date']).sort_values('period_date')
+                            elif 'month' in h.columns:
+                                h['month'] = pd.to_datetime(h['month'], errors='coerce')
+                                h = h.dropna(subset=['month']).sort_values('month')
+                            h_tail = h.tail(12)
+                            denom = float(h_tail[rev_col].sum())
+                            if denom != 0:
+                                pct = float(np.clip(float(h_tail[opx_col].sum()) / denom, 0.0, 1.0))
+                                pct_source = "historical"
+        except Exception:
+            pct = None
+            pct_source = None
+
+        if pct is None or pct <= 0:
+            pct = 0.27
+            pct_source = "default"
+
+        baseline_opex = np.maximum(total_rev, 0) * float(pct)
+
+        # Decide: expense assumptions vs baseline % (and whether to enforce a floor).
+        try:
+            expense_total = float(np.sum(opex))
+        except Exception:
+            expense_total = 0.0
+        try:
+            baseline_total = float(np.sum(baseline_opex))
+        except Exception:
+            baseline_total = 0.0
+
+        enforce_floor = True
+        if isinstance(assumptions, dict):
+            v = assumptions.get("enforce_opex_pct_floor", True)
+            if isinstance(v, str):
+                enforce_floor = v.strip().lower() not in ("0", "false", "no", "off")
+            else:
+                enforce_floor = bool(v) if v is not None else True
+
+        if expense_total <= 0:
+            # No expense assumptions (or they netted to zero): use baseline
+            opex = baseline_opex
+            diag["mode"] = "pct_of_revenue"
+        else:
+            if enforce_floor:
+                opex = np.maximum(opex, baseline_opex)
+                diag["mode"] = "expenses_with_pct_floor"
+                diag["used_pct_floor"] = bool(np.sum(baseline_opex > (opex + 1e-9)) > 0)
+            else:
+                diag["mode"] = "expenses_only"
+
+        diag["pct_floor"] = float(pct)
+        diag["pct_source"] = pct_source
+        diag["baseline_total_opex"] = baseline_total
+        diag["expense_total_opex"] = expense_total
+
+        # stash diagnostics for UI
+        try:
+            self._last_opex_diag = diag
+        except Exception:
+            pass
+
         return opex
     
     def _calculate_opex_with_config(

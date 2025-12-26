@@ -1426,6 +1426,43 @@ def aggregate_detailed_line_items_to_summary(db, scenario_id: str, user_id: str 
             interest = abs(float(sums.get('interest', 0) or 0))
             tax = abs(float(sums.get('tax', 0) or 0))
             other_income = float(sums.get('other_income', 0) or 0)
+
+            # -----------------------------------------------------------------
+            # OPEX detail breakdown (uses imported `sub_category` where present)
+            # -----------------------------------------------------------------
+            opex_personnel = 0.0
+            opex_facilities = 0.0
+            opex_admin = 0.0
+            opex_sales = 0.0
+            opex_other = 0.0
+            try:
+                opex_rows = period_df[period_df["__bucket"] == "opex"].copy()
+                if not opex_rows.empty:
+                    opex_rows["sub_category"] = opex_rows.get("sub_category", "").fillna("").astype(str)
+                    opex_rows["line_item_name"] = opex_rows.get("line_item_name", "").fillna("").astype(str)
+                    opex_rows["_txt"] = (opex_rows["sub_category"] + " " + opex_rows["line_item_name"]).str.lower()
+                    opex_rows["_amt"] = pd.to_numeric(opex_rows.get("amount"), errors="coerce").fillna(0.0).abs()
+
+                    for txt, amt in zip(opex_rows["_txt"].tolist(), opex_rows["_amt"].tolist()):
+                        t = str(txt)
+                        v = float(amt)
+                        if any(k in t for k in ["personnel", "salary", "salaries", "wage", "wages", "staff", "payroll"]):
+                            opex_personnel += v
+                        elif any(k in t for k in ["facilities", "utility", "utilities", "rent", "lease", "electric", "water", "maintenance"]):
+                            opex_facilities += v
+                        elif any(k in t for k in ["sales", "marketing", "advert", "advertising", "promotion", "commission"]):
+                            opex_sales += v
+                        elif any(k in t for k in ["admin", "administrative", "accounting", "audit", "legal", "office", "professional"]):
+                            opex_admin += v
+                        else:
+                            opex_other += v
+            except Exception:
+                pass
+
+            # Prefer the detail sum as total_opex when any detail exists (keeps totals consistent)
+            opex_detail_sum = float(opex_personnel + opex_facilities + opex_admin + opex_sales + opex_other)
+            if opex_detail_sum > 0:
+                opex = opex_detail_sum
             
             # Calculate derived metrics
             gross_profit = revenue - cogs
@@ -1464,6 +1501,11 @@ def aggregate_detailed_line_items_to_summary(db, scenario_id: str, user_id: str 
                 'gross_margin': gm_val,
                 'opex': opex_val,
                 'total_opex': opex_val,
+                'opex_personnel': float(opex_personnel),
+                'opex_facilities': float(opex_facilities),
+                'opex_admin': float(opex_admin),
+                'opex_sales': float(opex_sales),
+                'opex_other': float(opex_other),
                 'depreciation': dep_val,
                 'interest_expense': int_val,
                 'tax': tax_val,
@@ -3506,21 +3548,42 @@ def render_save_apply_tab(db, scenario_id: str, assumptions_set: AssumptionsSet,
     
     st.info("""
     Once saved, assumptions are automatically available in:
-    - **Forecast Section** - Uses static values or distribution means
+    - **Forecast Section** - Uses point estimates (deterministic values)
     - **Manufacturing Strategy** - Uses manufacturing assumptions
-    - **Monte Carlo Simulation** - Uses full distributions for stochastic analysis
+    - **Monte Carlo Simulation** - Uses distributions for uncertainty (if enabled)
     """)
     
     # Show what will be applied
     with st.expander("📊 Preview: Financial Assumptions to Apply", expanded=False):
         if assumptions_set.assumptions:
+            st.caption(
+                "**Note:** “Point estimate” vs “Distribution” here refers to **Monte Carlo uncertainty**, "
+                "not the forecast method (Pipeline/Hybrid/Trend)."
+            )
             preview_data = []
             for key, a in assumptions_set.assumptions.items():
+                # Format values with units for clarity
+                key_l = str(key or "").lower()
+                unit_l = str(getattr(a, "unit", "") or "").strip().lower()
+                is_pct = unit_l == "%" or "%" in str(a.display_name or "") or ("pct" in key_l) or ("margin" in key_l)
+                v = float(getattr(a, "final_static_value", 0.0) or 0.0)
+                if is_pct and v <= 1.01:
+                    v = v * 100.0
+                if is_pct:
+                    v_fmt = f"{v:.1f}%"
+                else:
+                    # Default to currency formatting for financial line items
+                    v_fmt = f"R {v:,.0f}"
+
                 preview_data.append({
                     'Metric': a.display_name,
-                    'Value Type': 'Distribution' if a.use_distribution else 'Static',
-                    'Value/Distribution': f"{a.user_distribution.distribution_type.title()}" if a.use_distribution else f"{a.final_static_value:,.0f}",
-                    'Applied To': 'Forecast, MC Sim' if a.use_distribution else 'Forecast'
+                    'Mode': 'Distribution (Monte Carlo)' if a.use_distribution else 'Point estimate (deterministic)',
+                    'Value / Distribution': (
+                        f"{a.user_distribution.distribution_type.title()}"
+                        if a.use_distribution
+                        else v_fmt
+                    ),
+                    'Used For': 'Monte Carlo uncertainty' if a.use_distribution else 'Deterministic forecast baseline',
                 })
             st.dataframe(pd.DataFrame(preview_data), hide_index=True, use_container_width=True)
     

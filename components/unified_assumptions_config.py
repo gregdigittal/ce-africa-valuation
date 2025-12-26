@@ -186,6 +186,57 @@ def save_unified_config(db, scenario_id: str, user_id: str, config: UnifiedAssum
         # Also set the forecast method toggle at top level for easy access
         assumptions['forecast_method'] = config.forecast_method
         assumptions['use_trend_forecast'] = (config.forecast_method in ('trend', 'hybrid'))
+
+        # --------------------------------------------------------------
+        # Forecast guardrails (persist from UI keys, if present)
+        # --------------------------------------------------------------
+        try:
+            enabled_key = f"ffy_floor_enabled_{scenario_id}"
+            manual_key = f"ffy_floor_manual_{scenario_id}"
+
+            if enabled_key in st.session_state:
+                assumptions["enforce_first_forecast_year_revenue_floor"] = bool(st.session_state.get(enabled_key))
+
+            manual_raw = st.session_state.get(manual_key, "")
+            manual_str = str(manual_raw).strip() if manual_raw is not None else ""
+            if manual_str:
+                # Parse a loose currency string: "R 1,234,567" → 1234567.0
+                cleaned = (
+                    manual_str.replace("R", "")
+                    .replace("r", "")
+                    .replace(",", "")
+                    .replace("\u00a0", " ")
+                    .strip()
+                )
+                try:
+                    manual_val = float(cleaned)
+                    assumptions["first_forecast_year_revenue_floor"] = manual_val
+                except Exception:
+                    # Don't block save; keep existing stored value if parsing fails.
+                    pass
+            else:
+                # Blank means: use automatic latest-actual floor
+                if "first_forecast_year_revenue_floor" in assumptions:
+                    assumptions.pop("first_forecast_year_revenue_floor", None)
+        except Exception:
+            pass
+
+        # Existing customer revenue (installed base) floor controls
+        try:
+            ex_enabled_key = f"existing_rev_floor_enabled_{scenario_id}"
+            ex_growth_key = f"existing_rev_growth_pct_{scenario_id}"
+
+            if ex_enabled_key in st.session_state:
+                assumptions["enforce_existing_customer_revenue_floor"] = bool(st.session_state.get(ex_enabled_key))
+
+            if ex_growth_key in st.session_state:
+                val = st.session_state.get(ex_growth_key)
+                try:
+                    assumptions["existing_customer_min_growth_pct"] = float(val)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         
         # Mark as saved in the assumptions
         assumptions['assumptions_saved'] = True
@@ -444,6 +495,103 @@ Best when you want the forecast fully driven by configured trends.
 - Aggregates calculated from line items
 - Monte Carlo uses configured distributions
             """)
+
+    # ==========================================================================
+    # FORECAST GUARDRAILS (Business rules)
+    # ==========================================================================
+    st.markdown("### 🛡️ Forecast Guardrails")
+    st.caption(
+        "These rules keep the forecast realistic and consistent with imported financial statements. "
+        "They apply regardless of forecast method."
+    )
+
+    # Load current saved values (from assumptions JSONB)
+    try:
+        _assum = db.get_scenario_assumptions(scenario_id, user_id) or {}
+    except Exception:
+        _assum = {}
+
+    default_enforce = True
+    try:
+        default_enforce = bool(_assum.get("enforce_first_forecast_year_revenue_floor", True))
+    except Exception:
+        default_enforce = True
+
+    existing_manual_floor = _assum.get("first_forecast_year_revenue_floor")
+    try:
+        existing_manual_floor = float(existing_manual_floor) if existing_manual_floor is not None else None
+    except Exception:
+        existing_manual_floor = None
+
+    colg1, colg2 = st.columns([1, 1])
+    with colg1:
+        st.checkbox(
+            "Enforce: first forecast year revenue ≥ latest actual year (recommended)",
+            value=default_enforce,
+            key=f"ffy_floor_enabled_{scenario_id}",
+            help=(
+                "If enabled, the model will uplift the first forecast-year revenue so it is not below the most recent "
+                "actual year from your imported Income Statement, unless you set a manual floor below that level."
+            ),
+        )
+    with colg2:
+        st.text_input(
+            "Manual floor (annual revenue, R) — optional",
+            value=f"{existing_manual_floor:.0f}" if isinstance(existing_manual_floor, (int, float)) else "",
+            key=f"ffy_floor_manual_{scenario_id}",
+            help=(
+                "Leave blank to use the latest actual year automatically. "
+                "Enter a LOWER number to deliberately allow a step-down in the first forecast year."
+            ),
+        )
+
+    st.markdown("---")
+    st.markdown("**Existing Customers Revenue (Installed Base) — Growth Control**")
+
+    # Default growth floor uses inflation rate (if set)
+    inflation_raw = _assum.get("inflation_rate", 0) or 0
+    try:
+        inflation_pct = float(inflation_raw) if inflation_raw is not None else 0.0
+        if inflation_pct <= 1.01:
+            inflation_pct = inflation_pct * 100.0
+    except Exception:
+        inflation_pct = 0.0
+
+    enabled_existing_floor = _assum.get("enforce_existing_customer_revenue_floor", True)
+    try:
+        enabled_existing_floor = bool(enabled_existing_floor)
+    except Exception:
+        enabled_existing_floor = True
+
+    existing_growth = _assum.get("existing_customer_min_growth_pct")
+    if existing_growth is None or existing_growth == "":
+        existing_growth = inflation_pct
+    try:
+        existing_growth = float(existing_growth)
+    except Exception:
+        existing_growth = float(inflation_pct)
+
+    cex1, cex2 = st.columns([1, 1])
+    with cex1:
+        st.checkbox(
+            "Enforce: Existing Customers revenue cannot decline YoY (recommended)",
+            value=enabled_existing_floor,
+            key=f"existing_rev_floor_enabled_{scenario_id}",
+            help=(
+                "Prevents the installed-base revenue (wear + refurb for existing customers) from dropping year-on-year. "
+                "Useful when wear profile data is incomplete/understated."
+            ),
+        )
+    with cex2:
+        st.number_input(
+            "Minimum growth for Existing Customers (%/yr)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(existing_growth),
+            step=0.5,
+            key=f"existing_rev_growth_pct_{scenario_id}",
+            help="If the installed-base model implies less growth, it will be scaled up to meet this floor. Default uses inflation.",
+        )
     
     st.markdown("---")
     

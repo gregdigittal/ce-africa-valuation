@@ -20,6 +20,12 @@ from dateutil.relativedelta import relativedelta
 from components.trend_forecast_analyzer import TrendForecastAnalyzer, TrendFunction
 from components.forecast_correlation_engine import ForecastCorrelationEngine, ForecastMethod
 
+# Supabase helpers (avoid silent 1000-row truncation on large selects)
+try:
+    from supabase_pagination import fetch_all_rows
+except Exception:
+    fetch_all_rows = None
+
 
 def load_historical_line_items(
     db,
@@ -49,12 +55,21 @@ def load_historical_line_items(
     
     try:
         if hasattr(db, 'client'):
-            response = db.client.table(table_name).select('*').eq(
-                'scenario_id', scenario_id
-            ).order('period_date').execute()
-            
-            if response.data:
-                df = pd.DataFrame(response.data)
+            q = (
+                db.client.table(table_name)
+                .select('*')
+                .eq('scenario_id', scenario_id)
+                .order('period_date')
+            )
+
+            if fetch_all_rows:
+                rows = fetch_all_rows(q, order_by="id")
+            else:
+                response = q.execute()
+                rows = response.data or []
+
+            if rows:
+                df = pd.DataFrame(rows)
                 if 'period_date' in df.columns:
                     df['period_date'] = pd.to_datetime(df['period_date'])
                 return df
@@ -121,23 +136,14 @@ def forecast_line_item(
     
     try:
         analyzer = TrendForecastAnalyzer()
-        trend_params = analyzer.fit_trend(historical_series, trend_function)
-        
-        # Generate forecast periods
-        last_date = historical_series.index[-1]
-        forecast_dates = pd.date_range(
-            start=last_date + relativedelta(months=1),
-            periods=forecast_periods,
-            freq='MS'
+        # Updated API: TrendForecastAnalyzer exposes `fit_trend_function` which returns
+        # (TrendParams, forecast_array). Older code used `fit_trend` + `forecast_value`.
+        _params, forecast = analyzer.fit_trend_function(
+            historical_series,
+            trend_function,
+            forecast_periods
         )
-        
-        forecast_values = []
-        for i, forecast_date in enumerate(forecast_dates):
-            periods_ahead = i + 1
-            value = analyzer.forecast_value(trend_params, periods_ahead)
-            forecast_values.append(value)
-        
-        return pd.Series(forecast_values)
+        return pd.Series(list(forecast))
     except Exception as e:
         st.warning(f"Error forecasting {line_item_name}: {e}")
         # Fallback to last value
@@ -312,6 +318,27 @@ def save_forecast_line_items(
     if not table_name:
         return False
     
+    def _insert_chunk(rows: List[Dict[str, Any]]) -> None:
+        """Insert a chunk of rows, splitting on payload errors."""
+        if not rows:
+            return
+        try:
+            db.client.table(table_name).insert(rows).execute()
+            return
+        except Exception as err:
+            msg = str(err)
+            # If it's a payload/timeout style error, split and retry.
+            transient = any(
+                s in msg.lower()
+                for s in ["413", "payload", "timeout", "timed out", "gateway", "connection", "502", "503", "504"]
+            )
+            if transient and len(rows) > 1:
+                mid = len(rows) // 2
+                _insert_chunk(rows[:mid])
+                _insert_chunk(rows[mid:])
+                return
+            raise
+
     try:
         # Prepare records
         records = []
@@ -343,13 +370,37 @@ def save_forecast_line_items(
             
             # Insert new forecasts
             if records:
-                db.client.table(table_name).insert(records).execute()
+                # Chunk inserts to avoid PostgREST payload limits (common with >1000 rows)
+                chunk_size = 500
+                for i in range(0, len(records), chunk_size):
+                    _insert_chunk(records[i:i + chunk_size])
             
             return True
     except Exception as e:
+        msg = str(e)
+
+        # Common when the forecast_* tables haven't been migrated yet (PostgREST schema cache)
+        if ("PGRST205" in msg) or ("schema cache" in msg.lower()) or ("could not find the table" in msg.lower()):
+            try:
+                warn_key = f"missing_forecast_line_item_tables_warned_{scenario_id}"
+                if warn_key not in st.session_state:
+                    st.warning(
+                        "Detailed **forecast line item** tables are not installed in Supabase, so the app will "
+                        "generate detailed forecasts but **skip saving** them.\n\n"
+                        "To enable saving, run the SQL migration: `migrations_add_forecast_line_items.sql`."
+                    )
+                    st.session_state[warn_key] = True
+            except Exception:
+                pass
+            return False
+
+        # Unexpected error: show details
         st.error(f"Error saving {statement_type} line item forecasts: {e}")
-        import traceback
-        st.error(traceback.format_exc())
+        try:
+            import traceback
+            st.error(traceback.format_exc())
+        except Exception:
+            pass
         return False
     
     return False
@@ -391,13 +442,25 @@ def load_forecast_line_items(
                 query = query.eq('snapshot_id', snapshot_id)
             else:
                 query = query.is_('snapshot_id', 'null')
-            
-            response = query.order('period_date').order('line_item_name').execute()
-            
-            if response.data:
-                df = pd.DataFrame(response.data)
+
+            # Avoid silent 1000-row truncation
+            if fetch_all_rows:
+                rows = fetch_all_rows(query, order_by="id")
+            else:
+                response = query.order('period_date').order('line_item_name').execute()
+                rows = response.data or []
+
+            if rows:
+                df = pd.DataFrame(rows)
                 if 'period_date' in df.columns:
                     df['period_date'] = pd.to_datetime(df['period_date'])
+                # Ensure stable ordering for display
+                try:
+                    sort_cols = [c for c in ["period_date", "line_item_name"] if c in df.columns]
+                    if sort_cols:
+                        df = df.sort_values(sort_cols)
+                except Exception:
+                    pass
                 return df
     except Exception as e:
         st.warning(f"Could not load {statement_type} forecast line items: {e}")

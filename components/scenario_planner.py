@@ -16,7 +16,7 @@ import streamlit as st
 import numpy as np
 import re
 from typing import Dict, List, Any, Optional, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
 
@@ -439,6 +439,51 @@ def render_scenario_planner(db, scenario_id: str, user_id: str, config):
     """Render the natural language scenario planner UI."""
     st.markdown("### 🎯 Scenario Planner")
     st.caption("Describe your business scenario in natural language and we'll configure all assumptions")
+
+    # ---------------------------------------------------------------------
+    # Persist scenario selection + text to DB so it survives navigation/sessions.
+    # ---------------------------------------------------------------------
+    scenario_input_key = f"scenario_input_{scenario_id}"
+    selected_template_key = f"scenario_template_{scenario_id}"
+
+    saved_state: Dict[str, Any] = {}
+    try:
+        if hasattr(db, "get_scenario_assumptions"):
+            _assum = db.get_scenario_assumptions(scenario_id, user_id) or {}
+            saved_state = (_assum.get("scenario_planner") or {}) if isinstance(_assum, dict) else {}
+    except Exception:
+        saved_state = {}
+
+    # Initialize session state from DB on first render
+    try:
+        if selected_template_key not in st.session_state and isinstance(saved_state, dict) and saved_state.get("selected_template"):
+            st.session_state[selected_template_key] = saved_state.get("selected_template")
+        if scenario_input_key not in st.session_state and isinstance(saved_state, dict) and saved_state.get("scenario_text"):
+            st.session_state[scenario_input_key] = saved_state.get("scenario_text")
+    except Exception:
+        pass
+
+    def _save_planner_state(text: str, template_key: Optional[str], params: Optional[ScenarioParameters] = None) -> None:
+        try:
+            if not hasattr(db, "get_scenario_assumptions"):
+                return
+            assumptions = db.get_scenario_assumptions(scenario_id, user_id) or {}
+            if not isinstance(assumptions, dict):
+                return
+            payload: Dict[str, Any] = {
+                "scenario_text": str(text or ""),
+                "selected_template": template_key,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            if params is not None:
+                try:
+                    payload["parsed_params"] = asdict(params)
+                except Exception:
+                    payload["parsed_params"] = {}
+            assumptions["scenario_planner"] = payload
+            db.update_assumptions(scenario_id, user_id, assumptions)
+        except Exception:
+            return
     
     # Template selection
     st.markdown("#### Quick Templates")
@@ -447,13 +492,14 @@ def render_scenario_planner(db, scenario_id: str, user_id: str, config):
     for i, (key, template) in enumerate(SCENARIO_TEMPLATES.items()):
         with cols[i]:
             if st.button(template['name'], key=f'template_{key}', use_container_width=True):
-                st.session_state['scenario_text'] = template['example']
-                st.session_state['selected_template'] = key
+                st.session_state[scenario_input_key] = template['example']
+                st.session_state[selected_template_key] = key
+                _save_planner_state(template['example'], key, None)
                 st.rerun()
     
     # Show selected template description
-    if 'selected_template' in st.session_state:
-        template = SCENARIO_TEMPLATES.get(st.session_state['selected_template'])
+    if selected_template_key in st.session_state:
+        template = SCENARIO_TEMPLATES.get(st.session_state.get(selected_template_key))
         if template:
             st.info(f"**{template['name']}:** {template['description']}")
     
@@ -461,7 +507,7 @@ def render_scenario_planner(db, scenario_id: str, user_id: str, config):
     st.markdown("#### Describe Your Scenario")
     
     # Text input for scenario
-    default_text = st.session_state.get('scenario_text', '')
+    default_text = st.session_state.get(scenario_input_key, '') or (saved_state.get("scenario_text", "") if isinstance(saved_state, dict) else "")
     scenario_text = st.text_area(
         "Scenario Description",
         value=default_text,
@@ -470,7 +516,7 @@ def render_scenario_planner(db, scenario_id: str, user_id: str, config):
 Overheads do not scale proportionate to revenue but rather at 25% of the growth in revenue. 
 To achieve such growth we will need to hold 10% more stock than what revenue growth is set at. 
 Terms with suppliers will remain constant.""",
-        key='scenario_input'
+        key=scenario_input_key
     )
     
     # Parse and preview
@@ -481,6 +527,7 @@ Terms with suppliers will remain constant.""",
             if scenario_text:
                 params = parse_scenario_description(scenario_text)
                 st.session_state['parsed_params'] = params
+                _save_planner_state(scenario_text, st.session_state.get(selected_template_key), params)
     
     with col2:
         if st.button("🚀 Apply Scenario", type='primary', use_container_width=True, key='apply_scenario'):
@@ -492,6 +539,7 @@ Terms with suppliers will remain constant.""",
                     'changes': changes,
                     'params': params
                 }
+                _save_planner_state(scenario_text, st.session_state.get(selected_template_key), params)
                 st.success(f"✅ Applied scenario to {count} line items!")
                 st.rerun()
     

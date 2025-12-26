@@ -1278,6 +1278,20 @@ def load_forecast_data(db, scenario_id: str, user_id: str = None, force_refresh:
     """
     # Check cache first (cache entire data structure)
     cache_key = f'forecast_data_{scenario_id}'
+    if force_refresh:
+        # Clear dependent caches so we truly reload from DB.
+        # (Otherwise load_assumptions / historical loaders can serve stale data.)
+        try:
+            for k in [
+                cache_key,
+                f"assumptions_{scenario_id}",
+                f"ai_assumptions_{scenario_id}",
+                f"historical_financials_{scenario_id}_{user_id or 'all'}",
+            ]:
+                if k in st.session_state:
+                    del st.session_state[k]
+        except Exception:
+            pass
     if not force_refresh and cache_key in st.session_state:
         cached = st.session_state[cache_key]
         # If cached has machines, keep the heavy parts cached but refresh historicals.
@@ -1554,7 +1568,10 @@ def run_forecast(db, scenario_id: str, user_id: str, progress_callback=None,
         if progress_callback:
             progress_callback(0.1, "Loading data...")
         
-        data = load_forecast_data(db, scenario_id, user_id)
+        # IMPORTANT: forecasts must always reflect the latest DB state (prospects, expenses,
+        # assumptions, and historics). We therefore force-refresh the forecast data bundle
+        # when running a forecast.
+        data = load_forecast_data(db, scenario_id, user_id, force_refresh=True)
         
         # Add historical data for trend calculation when Trend/Hybrid is selected.
         # We intentionally avoid using session_state toggles here; the forecast_method
@@ -1629,6 +1646,15 @@ def run_forecast(db, scenario_id: str, user_id: str, progress_callback=None,
         
         # Run forecast using engine
         results = engine.run_forecast(data, manufacturing_scenario, progress_callback)
+
+        # Attach run metadata (helps distinguish fresh runs vs old snapshots/cached results)
+        try:
+            results.setdefault("run_meta", {})
+            results["run_meta"]["generated_at"] = datetime.utcnow().isoformat()
+            results["run_meta"]["engine"] = "ForecastEngine"
+            results["run_meta"]["execution_mode"] = "local"
+        except Exception:
+            pass
         
         # Add data_source to results (from load_forecast_data)
         results['data_source'] = data.get('data_source', 'unknown')
@@ -1652,9 +1678,18 @@ def run_forecast(db, scenario_id: str, user_id: str, progress_callback=None,
             # Get forecast period count and start date
             forecast_periods = len(results.get('timeline', []))
             if forecast_periods > 0:
-                # Determine start date (next month after last historical or current date)
-                from dateutil.relativedelta import relativedelta
-                start_date = datetime.now().replace(day=1) + relativedelta(months=1)
+                # Determine start date from engine timeline (keeps detailed line items aligned)
+                start_date = None
+                try:
+                    timeline_dates = results.get("timeline_dates") or []
+                    if timeline_dates:
+                        ts0 = pd.to_datetime(timeline_dates[0], errors="coerce")
+                        if not pd.isna(ts0):
+                            start_date = ts0.date()
+                except Exception:
+                    start_date = None
+                if start_date is None:
+                    start_date = datetime.now().replace(day=1).date()
                 
                 # Get assumptions for line item configurations
                 assumptions_data = db.get_scenario_assumptions(scenario_id, user_id) if hasattr(db, 'get_scenario_assumptions') else {}
@@ -1665,37 +1700,36 @@ def run_forecast(db, scenario_id: str, user_id: str, progress_callback=None,
                 if 'line_item_assumptions' in assumptions_data:
                     line_item_assumptions = assumptions_data['line_item_assumptions']
                 
+                # Build a source forecast DataFrame (revenue) for correlations
+                source_df = None
+                try:
+                    rev_arr = results.get('revenue', {}).get('total') or []
+                    rev_list = list(rev_arr) if hasattr(rev_arr, '__iter__') else []
+                    if len(rev_list) < forecast_periods:
+                        if len(rev_list) == 0:
+                            rev_list = [0.0] * forecast_periods
+                        else:
+                            rev_list = rev_list + ([rev_list[-1]] * (forecast_periods - len(rev_list)))
+                    else:
+                        rev_list = rev_list[:forecast_periods]
+
+                    source_df = pd.DataFrame({
+                        'period_date': pd.date_range(start=start_date, periods=forecast_periods, freq='MS'),
+                        'revenue': rev_list,
+                        'total_revenue': rev_list
+                    })
+                except Exception:
+                    source_df = None
+
                 # Generate detailed forecasts for each statement type
                 for statement_type in ['income_statement', 'balance_sheet', 'cash_flow']:
                     try:
-                        # Build source forecast DataFrame for correlations
-                        source_df = None
-                        if statement_type == 'income_statement' and 'timeline' in results:
-                            # Create source forecast with revenue for correlations
-                            rev_arr = results.get('revenue', {}).get('total') or []
-                            # Align lengths defensively (avoid ValueError: All arrays must be same length)
-                            min_len = min(
-                                forecast_periods,
-                                len(rev_arr) if hasattr(rev_arr, '__len__') else 0
-                            )
-                            if min_len <= 0:
-                                min_len = forecast_periods
-                                rev_arr = [0] * forecast_periods
-                            else:
-                                rev_arr = list(rev_arr)[:min_len]
-                            
-                            source_df = pd.DataFrame({
-                                'period_date': pd.date_range(start=start_date, periods=min_len, freq='MS'),
-                                'revenue': rev_arr,
-                                'total_revenue': rev_arr
-                            })
-                        
-                            detailed_forecast = generate_detailed_forecast(
+                        detailed_forecast = generate_detailed_forecast(
                             db=db,
                             scenario_id=scenario_id,
                             user_id=user_id,
                             statement_type=statement_type,
-                            forecast_periods=len(source_df) if source_df is not None else forecast_periods,
+                            forecast_periods=forecast_periods,
                             start_date=start_date,
                             source_forecast=source_df,
                             assumptions={
@@ -2587,6 +2621,54 @@ def build_monthly_financials(
     """
     all_rows = []
     existing_periods: set[tuple[int, int]] = set()
+
+    # -------------------------------------------------------------------------
+    # Forecast OPEX detail allocation:
+    # Prefer using historical mix (Personnel/Facilities/Admin/Sales/Other shares)
+    # so forecast overhead categories follow the imported financials structure.
+    # -------------------------------------------------------------------------
+    opex_shares = None
+    try:
+        if historical_data is not None and not historical_data.empty:
+            h = historical_data.copy()
+            if "period_date" in h.columns:
+                h["period_date"] = pd.to_datetime(h["period_date"], errors="coerce")
+            # Use actual months only if the flag exists
+            if "is_actual" in h.columns:
+                try:
+                    h = h[h["is_actual"] == True]
+                except Exception:
+                    pass
+            # Require detail columns + total
+            cols = ["opex_personnel", "opex_facilities", "opex_admin", "opex_sales", "opex_other"]
+            if all(c in h.columns for c in cols) and ("total_opex" in h.columns or "opex" in h.columns):
+                total_col = "total_opex" if "total_opex" in h.columns else "opex"
+                for c in cols + [total_col]:
+                    h[c] = pd.to_numeric(h[c], errors="coerce").fillna(0.0).abs()
+                h = h[h[total_col] > 0]
+                # Latest 12 months for stability
+                if "period_date" in h.columns:
+                    h = h.dropna(subset=["period_date"]).sort_values("period_date")
+                h_tail = h.tail(12)
+                denom = float(h_tail[total_col].sum())
+                if denom > 0:
+                    sums = {c: float(h_tail[c].sum()) for c in cols}
+                    subtotal = float(sum(sums.values()))
+                    if subtotal > 0:
+                        # Normalize to 1.0 (and reconcile to total_opex)
+                        opex_shares = {c: float(np.clip(v / subtotal, 0.0, 1.0)) for c, v in sums.items()}
+    except Exception:
+        opex_shares = None
+
+    if not isinstance(opex_shares, dict) or not opex_shares:
+        # Default ratios (legacy behavior)
+        opex_shares = {
+            "opex_personnel": 0.45,
+            "opex_facilities": 0.20,
+            "opex_admin": 0.15,
+            "opex_sales": 0.12,
+            "opex_other": 0.08,
+        }
     
     # Add historical data first if available
     if historical_data is not None and not historical_data.empty:
@@ -2613,25 +2695,29 @@ def build_monthly_financials(
                     is_actual = True
                 data_type = row.get("data_type") if isinstance(row.get("data_type"), str) else ("Actual" if is_actual else "Forecast (YTD fill)")
                 
-                # Get total opex for fallback calculations
+                # Get total opex for fallback calculations (excludes depreciation in this model)
                 total_opex = row.get('total_opex', row.get('opex', 0)) or 0
                 
-                # Get actual expense breakdowns if available (from historic_expense_categories)
-                # If not available, estimate based on typical ratios
+                # OPEX detail: prefer canonical buckets from imported `sub_category` mapping
+                # (opex_personnel / opex_facilities / opex_admin / opex_sales / opex_other).
+                # Fall back to legacy historic_expense_categories style columns when present.
                 opex_personnel = row.get('opex_personnel', 0) or 0
                 opex_facilities = row.get('opex_facilities', 0) or 0
-                opex_logistics = row.get('opex_logistics', 0) or 0
-                opex_professional = row.get('opex_professional', 0) or 0
+                opex_admin = row.get('opex_admin', row.get('opex_logistics', 0)) or 0
+                opex_sales = row.get('opex_sales', row.get('opex_professional', 0)) or 0
+                opex_other_in = row.get('opex_other', 0) or 0
                 depreciation = row.get('depreciation', 0) or 0
                 interest_expense = row.get('interest_expense', 0) or 0
                 
-                # Calculate opex_other as remainder
-                known_opex = opex_personnel + opex_facilities + opex_logistics + opex_professional
-                opex_other = max(total_opex - known_opex - depreciation, 0) if known_opex > 0 else total_opex
-                
-                # Use opex_logistics as opex_admin proxy, opex_professional as opex_sales proxy
-                opex_admin = opex_logistics
-                opex_sales = opex_professional
+                # Calculate opex_other as remainder ONLY when a split exists but "other" wasn't provided.
+                known_opex = opex_personnel + opex_facilities + opex_admin + opex_sales
+                if opex_other_in and opex_other_in != 0:
+                    opex_other = opex_other_in
+                elif known_opex > 0:
+                    # Do NOT subtract depreciation here; depreciation is separate.
+                    opex_other = max(float(total_opex) - float(known_opex), 0.0)
+                else:
+                    opex_other = float(total_opex)
                 
                 # Get P&L items
                 ebit = row.get('ebit', 0) or 0
@@ -2661,9 +2747,28 @@ def build_monthly_financials(
                             service_share = split_overall.get("service_share")
                         if wear_share is not None:
                             ws = float(wear_share)
-                            ss = float(service_share) if service_share is not None else float(1 - ws)
+                            ss = float(service_share) if service_share is not None else None
+
+                            # Support both 0-1 and 0-100 formats (defensive)
+                            if ws > 1.01:
+                                ws = ws / 100.0
+                            if ss is not None and ss > 1.01:
+                                ss = ss / 100.0
+
+                            # Clamp and normalize so the split never exceeds total revenue
+                            ws = float(np.clip(ws, 0.0, 1.0))
+                            if ss is None:
+                                ss = 1.0 - ws
+                            else:
+                                ss = float(np.clip(ss, 0.0, 1.0))
+                                tot = ws + ss
+                                if tot > 0:
+                                    ws = ws / tot
+                                    ss = ss / tot
+
                             rev_wear_existing = float(total_revenue_val) * ws
-                            rev_service_existing = float(total_revenue_val) * ss
+                            # Remainder to ensure Wear + Refurb ties to definitive income statement revenue
+                            rev_service_existing = float(total_revenue_val) - float(rev_wear_existing)
                 except Exception:
                     pass
                 
@@ -2941,6 +3046,14 @@ def build_monthly_financials(
             ytd_debug_info["has_ytd_actuals"] = len(actual_months) > 0
             ytd_debug_info["ytd_months_found"] = len(actual_months)
             ytd_debug_info["ytd_periods"] = [f"{cy}-{m:02d}" for m in actual_months]
+            # Compute YTD revenue total from the same monthly rows (avoid displaying 0).
+            ytd_debug_info["ytd_revenue_total"] = float(
+                sum(
+                    float(r.get("total_revenue", 0) or 0)
+                    for r in all_rows
+                    if int(r.get("period_year", -1)) == cy and bool(r.get("is_actual", True))
+                )
+            )
         except Exception:
             pass
     st.session_state['ytd_diagnostic'] = ytd_debug_info
@@ -3027,11 +3140,13 @@ def build_monthly_financials(
         
         # Operating expenses breakdown
         total_opex = opex_arr[i] if i < len(opex_arr) else (total_revenue * 0.27)
-        opex_personnel = total_opex * 0.45
-        opex_facilities = total_opex * 0.20
-        opex_admin = total_opex * 0.15
-        opex_sales = total_opex * 0.12
-        opex_other = total_opex * 0.08
+        opex_personnel = total_opex * float(opex_shares.get("opex_personnel", 0.45))
+        opex_facilities = total_opex * float(opex_shares.get("opex_facilities", 0.20))
+        opex_admin = total_opex * float(opex_shares.get("opex_admin", 0.15))
+        opex_sales = total_opex * float(opex_shares.get("opex_sales", 0.12))
+        # Residual into "Other" to guarantee components reconcile to total_opex
+        known = opex_personnel + opex_facilities + opex_admin + opex_sales
+        opex_other = max(float(total_opex) - float(known), 0.0)
         
         # Operating metrics
         ebitda = total_gross_profit - total_opex
@@ -3138,50 +3253,64 @@ def aggregate_to_annual(monthly_df: pd.DataFrame) -> pd.DataFrame:
     if monthly_df.empty:
         return pd.DataFrame()
     
-    from datetime import datetime
-    current_year = datetime.now().year
-    current_month = datetime.now().month
-    
     numeric_cols = [col for col in monthly_df.columns if col not in 
                    ['period_date', 'period_year', 'period_month', 'period_label', 
                     'is_actual', 'data_type', 'is_annual_total']]
     
-    # Group by year, preserving is_actual flag
+    # Group by year.
+    # IMPORTANT: a year should only be marked as "Actual" if *all* its months are actual.
+    # Mixed years (YTD actual + forecast fill) must NOT be labeled as Actual ("A").
+    if 'is_actual' not in monthly_df.columns:
+        monthly_df = monthly_df.copy()
+        monthly_df['is_actual'] = False
     annual_df = monthly_df.groupby('period_year').agg({
         **{col: 'sum' for col in numeric_cols},
-        'is_actual': 'any'  # If any month is actual, the year is actual
+        'is_actual': 'all'  # Only true when all months in the year are actuals
     }).reset_index()
-    
-    # For current year, check if it has both actual and forecast data
-    current_year_data = monthly_df[monthly_df['period_year'] == current_year]
-    if not current_year_data.empty:
-        has_actuals = current_year_data['is_actual'].any()
-        has_forecast = (~current_year_data['is_actual']).any()
-        
-        if has_actuals and has_forecast:
-            # Current year has both actuals (YTD) and forecast (remaining months)
-            # Mark as "Actual + Forecast" for clarity
-            annual_df.loc[annual_df['period_year'] == current_year, 'data_type'] = 'Actual + Forecast Annual'
-            # Don't mark as "A" since it's partially forecast
-            annual_df.loc[annual_df['period_year'] == current_year, 'period_label'] = f"FY{current_year}"
-        elif has_actuals:
-            # Only actuals (shouldn't happen if forecast is running, but handle it)
-            annual_df.loc[annual_df['period_year'] == current_year, 'data_type'] = 'Actual Annual'
-            annual_df.loc[annual_df['period_year'] == current_year, 'period_label'] = f"FY{current_year} A"
-        elif has_forecast:
-            # Only forecast (full year forecast)
-            annual_df.loc[annual_df['period_year'] == current_year, 'data_type'] = 'Forecast Annual'
-            annual_df.loc[annual_df['period_year'] == current_year, 'period_label'] = f"FY{current_year}"
-    
-    # For other years, use existing logic
-    for idx, row in annual_df.iterrows():
-        if row['period_year'] != current_year:
-            if row.get('is_actual', False):
-                annual_df.at[idx, 'period_label'] = f"FY{row['period_year']} A"
-                annual_df.at[idx, 'data_type'] = 'Actual Annual'
-            else:
-                annual_df.at[idx, 'period_label'] = f"FY{row['period_year']}"
-                annual_df.at[idx, 'data_type'] = 'Forecast Annual'
+
+    # Label years based on whether they contain actuals, forecasts, or both.
+    # (e.g., FY2025 A/F when the year contains both actual and forecast months)
+    try:
+        flags = (
+            monthly_df.groupby('period_year')['is_actual']
+            .agg(has_actual='any', all_actual='all')
+            .reset_index()
+        )
+        flags['has_forecast'] = ~flags['all_actual']
+        annual_df = annual_df.merge(flags, on='period_year', how='left')
+    except Exception:
+        annual_df['has_actual'] = annual_df.get('is_actual', False)
+        annual_df['all_actual'] = annual_df.get('is_actual', False)
+        annual_df['has_forecast'] = ~annual_df.get('is_actual', False)
+
+    def _label_year(row) -> str:
+        y = int(row.get('period_year', 0) or 0)
+        has_a = bool(row.get('has_actual', False))
+        has_f = bool(row.get('has_forecast', False)) and not bool(row.get('all_actual', False))
+        if has_a and has_f:
+            return f"FY{y} A/F"
+        if bool(row.get('is_actual', False)):
+            return f"FY{y} A"
+        return f"FY{y}"
+
+    def _dtype_year(row) -> str:
+        has_a = bool(row.get('has_actual', False))
+        has_f = bool(row.get('has_forecast', False)) and not bool(row.get('all_actual', False))
+        if has_a and has_f:
+            return 'Actual + Forecast Annual'
+        if bool(row.get('is_actual', False)):
+            return 'Actual Annual'
+        return 'Forecast Annual'
+
+    annual_df['period_label'] = annual_df.apply(_label_year, axis=1)
+    annual_df['data_type'] = annual_df.apply(_dtype_year, axis=1)
+    # Clean helper columns if present
+    for c in ['has_actual', 'all_actual', 'has_forecast']:
+        if c in annual_df.columns:
+            try:
+                annual_df = annual_df.drop(columns=[c])
+            except Exception:
+                pass
     
     annual_df['is_annual_total'] = True
     annual_df['period_month'] = 12
@@ -3552,16 +3681,30 @@ def build_balance_sheet(
     # Net income and retained earnings (vectorized)
     net_income_arr = ebit_arr * (1 - tax_rate)
     retained_earnings_arr = np.cumsum(net_income_arr)
-    
-    # Cash balance (vectorized)
-    cash_flow_arr = net_income_arr - monthly_capex_arr + monthly_depreciation_arr
-    cash_balance_arr = initial_cash + np.cumsum(cash_flow_arr)
-    
+
     # Other calculations (vectorized)
     prepaid_arr = total_rev_arr * 0.02
     accrued_arr = opex_arr * 0.3
-    total_current_assets_arr = np.maximum(cash_balance_arr, 0) + accounts_receivable_arr + inventory_total_arr + prepaid_arr
-    total_current_liabilities_arr = accounts_payable_arr + accrued_arr
+
+    # --------------------------------------------------------------------------
+    # Balance Sheet must balance:
+    # Assets = Liabilities + Equity
+    #
+    # We treat cash/overdraft as the balancing item (plug) so the identity always holds.
+    # Negative cash is modeled as short-term debt (overdraft) under current liabilities.
+    # --------------------------------------------------------------------------
+    total_equity_arr = initial_equity + retained_earnings_arr
+    non_cash_current_assets_arr = accounts_receivable_arr + inventory_total_arr + prepaid_arr
+    liab_ex_overdraft_arr = accounts_payable_arr + accrued_arr + np.array([initial_debt] * n_periods)
+    cash_raw_arr = (liab_ex_overdraft_arr + total_equity_arr) - (non_cash_current_assets_arr + net_ppe_arr)
+    cash_and_equivalents_arr = np.maximum(cash_raw_arr, 0)
+    overdraft_arr = np.maximum(-cash_raw_arr, 0)
+
+    total_current_assets_arr = cash_and_equivalents_arr + non_cash_current_assets_arr
+    total_current_liabilities_arr = accounts_payable_arr + accrued_arr + overdraft_arr
+    total_liabilities_arr = total_current_liabilities_arr + np.array([initial_debt] * n_periods)
+    total_assets_arr = total_current_assets_arr + net_ppe_arr
+    total_liabilities_and_equity_arr = total_liabilities_arr + total_equity_arr
     
     # Build DataFrame from arrays (much faster than appending in loop)
     forecast_data = {
@@ -3573,7 +3716,7 @@ def build_balance_sheet(
         'data_type': ['Forecast'] * n_periods,
             
             # Assets - Current
-        'cash_and_equivalents': np.maximum(cash_balance_arr, 0),
+        'cash_and_equivalents': cash_and_equivalents_arr,
         'accounts_receivable': accounts_receivable_arr,
         'inventory_raw_materials': inventory_raw_materials_arr,
         'inventory_finished_goods': inventory_finished_goods_arr,
@@ -3593,7 +3736,7 @@ def build_balance_sheet(
             # Liabilities - Current
         'accounts_payable': accounts_payable_arr,
         'accrued_expenses': accrued_arr,
-        'short_term_debt': [0] * n_periods,
+        'short_term_debt': overdraft_arr,
         'total_current_liabilities': total_current_liabilities_arr,
             
             # Liabilities - Non-Current
@@ -3603,12 +3746,12 @@ def build_balance_sheet(
             # Equity
         'share_capital': [initial_equity] * n_periods,
         'retained_earnings': retained_earnings_arr,
-        'total_equity': initial_equity + retained_earnings_arr,
+        'total_equity': total_equity_arr,
             
             # Totals
-        'total_assets': total_current_assets_arr + net_ppe_arr,
-        'total_liabilities': total_current_liabilities_arr + np.array([initial_debt] * n_periods),
-        'total_liabilities_and_equity': [0] * n_periods,
+        'total_assets': total_assets_arr,
+        'total_liabilities': total_liabilities_arr,
+        'total_liabilities_and_equity': total_liabilities_and_equity_arr,
         'net_working_capital': (accounts_receivable_arr + inventory_total_arr) - accounts_payable_arr,
     }
     
@@ -3617,7 +3760,31 @@ def build_balance_sheet(
     
     df = pd.DataFrame(all_rows)
     if not df.empty:
-        df['total_liabilities_and_equity'] = df['total_liabilities'] + df['total_equity']
+        # Ensure totals exist for historical rows too (historical rows are estimated from P&L).
+        try:
+            if 'total_current_liabilities' in df.columns and 'total_non_current_liabilities' in df.columns:
+                df['total_liabilities'] = (
+                    pd.to_numeric(df['total_current_liabilities'], errors='coerce').fillna(0.0)
+                    + pd.to_numeric(df['total_non_current_liabilities'], errors='coerce').fillna(0.0)
+                )
+        except Exception:
+            pass
+        try:
+            if 'total_current_assets' in df.columns and 'total_non_current_assets' in df.columns:
+                df['total_assets'] = (
+                    pd.to_numeric(df['total_current_assets'], errors='coerce').fillna(0.0)
+                    + pd.to_numeric(df['total_non_current_assets'], errors='coerce').fillna(0.0)
+                )
+        except Exception:
+            pass
+        try:
+            if 'total_liabilities' in df.columns and 'total_equity' in df.columns:
+                df['total_liabilities_and_equity'] = (
+                    pd.to_numeric(df['total_liabilities'], errors='coerce').fillna(0.0)
+                    + pd.to_numeric(df['total_equity'], errors='coerce').fillna(0.0)
+                )
+        except Exception:
+            pass
         df = df.sort_values(['period_year', 'period_month']).reset_index(drop=True)
     
     return df
@@ -3921,6 +4088,15 @@ def render_balance_sheet_table(data: pd.DataFrame, view_mode: str = 'annual'):
     if data.empty:
         st.warning("No balance sheet data available.")
         return
+
+    # Show run meta (or snapshot meta) so it’s obvious what you’re looking at
+    try:
+        meta = results.get("run_meta") or {}
+        generated_at = meta.get("generated_at")
+        if isinstance(generated_at, str) and generated_at.strip():
+            st.caption(f"Run generated at (UTC): `{generated_at}`")
+    except Exception:
+        pass
     
     # Show data type legend if we have both actuals and forecast
     has_actuals = 'is_actual' in data.columns and data['is_actual'].any()
@@ -3931,26 +4107,79 @@ def render_balance_sheet_table(data: pd.DataFrame, view_mode: str = 'annual'):
     
     # Aggregate to annual if needed
     if view_mode == 'annual':
-        # Group by year, preserving is_actual flag
-        numeric_cols = [c for c in data.columns if c not in 
-                       ['period_year', 'period_month', 'period_date', 'period_label', 
-                        'is_actual', 'data_type']]
-        
-        annual = data.groupby('period_year').agg({
-            **{col: 'sum' if data[col].dtype in ['int64', 'float64'] else 'first' 
-               for col in numeric_cols},
-            'is_actual': 'any'  # If any month is actual, the year is actual
-        }).reset_index()
-        
-        # Create period_label with "A" marker for historical years
-        annual['period_label'] = annual.apply(
-            lambda row: f"FY{row['period_year']} A" if row.get('is_actual', False) else f"FY{row['period_year']}",
-            axis=1
-        )
+        # Balance sheet is a *point-in-time* statement.
+        # Annual view should show the ending balance (last month) for each year, not a sum.
+        if 'is_actual' not in data.columns:
+            data = data.copy()
+            data['is_actual'] = False
+
+        try:
+            data_sorted = data.sort_values(['period_year', 'period_month']).copy()
+        except Exception:
+            data_sorted = data.copy()
+
+        # Determine year flags (Actual-only vs mixed A/F)
+        try:
+            year_flags = data_sorted.groupby('period_year')['is_actual'].agg(has_actual='any', all_actual='all').reset_index()
+            year_flags['has_forecast'] = ~year_flags['all_actual']
+        except Exception:
+            year_flags = pd.DataFrame({'period_year': data_sorted['period_year'].unique()})
+            year_flags['has_actual'] = False
+            year_flags['all_actual'] = False
+            year_flags['has_forecast'] = True
+
+        # Take last month row per year
+        annual = data_sorted.groupby('period_year').tail(1).copy()
+        annual = annual.merge(year_flags, on='period_year', how='left')
+        annual['is_actual'] = annual.get('all_actual', annual.get('is_actual', False))
+
+        def _label_year(row) -> str:
+            y = int(row.get('period_year', 0) or 0)
+            has_a = bool(row.get('has_actual', False))
+            has_f = bool(row.get('has_forecast', False)) and not bool(row.get('all_actual', False))
+            if has_a and has_f:
+                return f"FY{y} A/F"
+            if bool(row.get('is_actual', False)):
+                return f"FY{y} A"
+            return f"FY{y}"
+
+        def _dtype_year(row) -> str:
+            has_a = bool(row.get('has_actual', False))
+            has_f = bool(row.get('has_forecast', False)) and not bool(row.get('all_actual', False))
+            if has_a and has_f:
+                return 'Actual + Forecast Annual'
+            if bool(row.get('is_actual', False)):
+                return 'Actual Annual'
+            return 'Forecast Annual'
+
+        annual['period_label'] = annual.apply(_label_year, axis=1)
+        annual['data_type'] = annual.apply(_dtype_year, axis=1)
+        for c in ['has_actual', 'all_actual', 'has_forecast']:
+            if c in annual.columns:
+                annual = annual.drop(columns=[c], errors='ignore')
+        annual = annual.reset_index(drop=True)
         data = annual
     
     periods = data['period_label'].tolist()
     is_actual_flags = data['is_actual'].tolist() if 'is_actual' in data.columns else [False] * len(periods)
+
+    # Balance check (Assets - (Liabilities + Equity))
+    try:
+        if 'balance_check' not in data.columns:
+            ta = pd.to_numeric(data.get('total_assets', 0.0), errors='coerce').fillna(0.0)
+            tle = None
+            if 'total_liabilities_and_equity' in data.columns:
+                tle = pd.to_numeric(data.get('total_liabilities_and_equity', 0.0), errors='coerce').fillna(0.0)
+            elif 'total_liabilities' in data.columns and 'total_equity' in data.columns:
+                tle = (
+                    pd.to_numeric(data.get('total_liabilities', 0.0), errors='coerce').fillna(0.0)
+                    + pd.to_numeric(data.get('total_equity', 0.0), errors='coerce').fillna(0.0)
+                )
+            if tle is not None:
+                data = data.copy()
+                data['balance_check'] = ta - tle
+    except Exception:
+        pass
     
     # Check if we have manufacturing-specific columns
     has_mfg_ppe = 'ppe_manufacturing' in data.columns and data['ppe_manufacturing'].sum() > 0
@@ -4017,12 +4246,21 @@ def render_balance_sheet_table(data: pd.DataFrame, view_mode: str = 'annual'):
         ('TOTAL EQUITY', 'total_equity', 'subtotal'),
         ('', None, 'spacer'),
         ('TOTAL LIABILITIES & EQUITY', 'total_liabilities_and_equity', 'total'),
+        ('Balance Check (Assets - (L+E))', 'balance_check', 'memo'),
         ('', None, 'spacer'),
         ('Net Working Capital', 'net_working_capital', 'memo'),
     ])
     
     # Build HTML table
-    html = '<table style="width:100%; border-collapse:collapse; font-size:0.85rem;">'
+    css = """
+    <style>
+      .bs-container { overflow-x: auto; margin: 1rem 0; }
+      .bs-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 0.85rem; min-width: 980px; }
+      .bs-table th:first-child, .bs-table td:first-child { position: sticky; left: 0; z-index: 3; background: inherit; }
+      .bs-table th:first-child { z-index: 4; }
+    </style>
+    """
+    html = css + '<div class="bs-container"><table class="bs-table" style="width:100%;">'
     html += '<tr style="background:#1E1E1E;">'
     html += '<th style="text-align:left; padding:8px; border-bottom:2px solid #404040;">Line Item</th>'
     for i, period in enumerate(periods):
@@ -4084,7 +4322,7 @@ def render_balance_sheet_table(data: pd.DataFrame, view_mode: str = 'annual'):
         
         html += '</tr>'
     
-    html += '</table>'
+    html += '</table></div>'
     st.markdown(html, unsafe_allow_html=True)
 
 
@@ -4108,10 +4346,15 @@ def render_cash_flow_table(data: pd.DataFrame, view_mode: str = 'annual'):
                         'is_actual', 'data_type', 'beginning_cash', 'ending_cash']]
         
         # Group by year, preserving is_actual flag
+        if 'is_actual' not in data.columns:
+            data = data.copy()
+            data['is_actual'] = False
+
         annual = data.groupby('period_year').agg({
             **{col: 'sum' if data[col].dtype in ['int64', 'float64'] else 'first' 
                for col in numeric_cols},
-            'is_actual': 'any'  # If any month is actual, the year is actual
+            # Only mark year as actual when all months are actual (avoid mislabeling mixed years)
+            'is_actual': 'all'
         }).reset_index()
         
         # Get ending cash from last month of each year
@@ -4120,11 +4363,30 @@ def render_cash_flow_table(data: pd.DataFrame, view_mode: str = 'annual'):
         ]
         annual = annual.merge(ending_data, on='period_year', how='left')
         
-        # Create period_label with "A" marker for historical years
-        annual['period_label'] = annual.apply(
-            lambda row: f"FY{row['period_year']} A" if row.get('is_actual', False) else f"FY{row['period_year']}",
-            axis=1
-        )
+        # Label years (A / A/F / Forecast)
+        try:
+            flags = data.groupby('period_year')['is_actual'].agg(has_actual='any', all_actual='all').reset_index()
+            flags['has_forecast'] = ~flags['all_actual']
+            annual = annual.merge(flags, on='period_year', how='left')
+        except Exception:
+            annual['has_actual'] = annual.get('is_actual', False)
+            annual['all_actual'] = annual.get('is_actual', False)
+            annual['has_forecast'] = ~annual.get('is_actual', False)
+
+        def _label_year(row) -> str:
+            y = int(row.get('period_year', 0) or 0)
+            has_a = bool(row.get('has_actual', False))
+            has_f = bool(row.get('has_forecast', False)) and not bool(row.get('all_actual', False))
+            if has_a and has_f:
+                return f"FY{y} A/F"
+            if bool(row.get('is_actual', False)):
+                return f"FY{y} A"
+            return f"FY{y}"
+
+        annual['period_label'] = annual.apply(_label_year, axis=1)
+        for c in ['has_actual', 'all_actual', 'has_forecast']:
+            if c in annual.columns:
+                annual = annual.drop(columns=[c], errors='ignore')
         data = annual
     
     periods = data['period_label'].tolist()
@@ -4173,7 +4435,15 @@ def render_cash_flow_table(data: pd.DataFrame, view_mode: str = 'annual'):
         ('Ending Cash Balance', 'ending_cash', 'memo'),
     ])
     
-    html = '<table style="width:100%; border-collapse:collapse; font-size:0.85rem;">'
+    css = """
+    <style>
+      .cf-container { overflow-x: auto; margin: 1rem 0; }
+      .cf-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 0.85rem; min-width: 980px; }
+      .cf-table th:first-child, .cf-table td:first-child { position: sticky; left: 0; z-index: 3; background: inherit; }
+      .cf-table th:first-child { z-index: 4; }
+    </style>
+    """
+    html = css + '<div class="cf-container"><table class="cf-table" style="width:100%;">'
     html += '<tr style="background:#1E1E1E;">'
     html += '<th style="text-align:left; padding:8px; border-bottom:2px solid #404040;">Line Item</th>'
     for i, period in enumerate(periods):
@@ -4235,7 +4505,7 @@ def render_cash_flow_table(data: pd.DataFrame, view_mode: str = 'annual'):
         
         html += '</tr>'
     
-    html += '</table>'
+    html += '</table></div>'
     st.markdown(html, unsafe_allow_html=True)
 
 
@@ -4268,10 +4538,13 @@ def _render_historical_validation_check(data: pd.DataFrame):
     revenue = actuals_data.get('total_revenue', pd.Series([0] * len(actuals_data))).fillna(0)
     cogs = actuals_data.get('total_cogs', pd.Series([0] * len(actuals_data))).fillna(0)
     opex = actuals_data.get('total_opex', pd.Series([0] * len(actuals_data))).fillna(0)
+    depreciation = actuals_data.get('depreciation', pd.Series([0] * len(actuals_data))).fillna(0)
     interest = actuals_data.get('interest_expense', pd.Series([0] * len(actuals_data))).fillna(0)
     tax = actuals_data.get('tax_expense', pd.Series([0] * len(actuals_data))).fillna(0)
+    other_income = actuals_data.get('other_income', pd.Series([0] * len(actuals_data))).fillna(0)
     
-    calculated_net_income = revenue - cogs - opex - interest - tax
+    # IMPORTANT: total_opex excludes depreciation in this model (depreciation is shown separately).
+    calculated_net_income = revenue - cogs - opex - depreciation - interest - tax + other_income
     
     # Aggregate totals
     imported_total = float(imported_net_income.sum())
@@ -4318,17 +4591,9 @@ def render_income_statement_table(
     
     # Get periods to display
     periods = data['period_label'].tolist()
-    max_cols = 8 if view_mode == 'annual' else 12
-    
-    if len(periods) > max_cols:
-        if str(period_window).lower().startswith("ear"):
-            periods = periods[:max_cols]
-            st.caption(f"📊 Showing earliest {max_cols} periods. Export for complete data.")
-        else:
-            periods = periods[-max_cols:]
-            st.caption(f"📊 Showing latest {max_cols} periods. Export for complete data.")
-    
-    display_data = data[data['period_label'].isin(periods)]
+    # Show all periods by default and rely on horizontal scrolling + frozen first column.
+    # (Previously we truncated to 8/12 columns; that hid history and forced exports.)
+    display_data = data
     
     # Build CSS
     css = f"""
@@ -4339,7 +4604,8 @@ def render_income_statement_table(
     }}
     .fs-table {{
         width: 100%;
-        border-collapse: collapse;
+        border-collapse: separate;
+        border-spacing: 0;
         font-family: 'Segoe UI', Tahoma, sans-serif;
         font-size: 12px;
         min-width: 800px;
@@ -4361,6 +4627,27 @@ def render_income_statement_table(
     .fs-table th:first-child {{
         text-align: left;
         min-width: 200px;
+    }}
+    /* Freeze first column (Line Item) so it stays visible while scrolling horizontally */
+    .fs-table th:first-child,
+    .fs-table td:first-child {{
+        position: sticky;
+        left: 0;
+        z-index: 5;
+        background: {DARK_BG};
+    }}
+    .fs-table th:first-child {{
+        z-index: 6;
+    }}
+    /* Preserve row styling for the frozen first column */
+    .fs-table .subtotal td:first-child {{
+        background: rgba(212, 165, 55, 0.05) !important;
+    }}
+    .fs-table .total td:first-child {{
+        background: rgba(212, 165, 55, 0.15) !important;
+    }}
+    .fs-table .actual td:first-child {{
+        background: rgba(100, 116, 139, 0.15) !important;
     }}
     .fs-table td {{
         padding: 6px 8px;
@@ -4680,30 +4967,93 @@ def _merge_detailed_line_items_into_monthly_data(
             
             # Update each matching row
             for idx in matching_rows.index:
-                # Aggregate by category for OPEX
-                opex_items = period_df[
-                    period_df['category'].str.contains('Operating Expenses|OPEX', case=False, na=False)
-                ]
-                
-                if not opex_items.empty:
-                    # Group by line_item_name and sum amounts
-                    for line_item_name, item_group in opex_items.groupby('line_item_name'):
-                        amount = item_group['amount'].sum()
-                        # Use absolute value (expenses are typically negative in accounting)
-                        amount = abs(amount) if amount < 0 else amount
-                        
-                        # Map to column name
-                        column_name = None
-                        for key, col in line_item_mapping.items():
-                            if key.lower() in line_item_name.lower():
-                                column_name = col
-                                break
-                        
-                        if column_name and column_name in monthly_data.columns:
-                            # Only update if current value is 0 or NaN
-                            current_val = monthly_data.loc[idx, column_name]
-                            if pd.isna(current_val) or current_val == 0:
-                                monthly_data.loc[idx, column_name] = amount
+                # -----------------------------------------------------------------
+                # OPEX detail (prefer `sub_category` mapping from imported financials)
+                # -----------------------------------------------------------------
+                try:
+                    o = period_df.copy()
+                    o["category"] = o.get("category", "").fillna("").astype(str)
+                    o["sub_category"] = o.get("sub_category", "").fillna("").astype(str)
+                    o["line_item_name"] = o.get("line_item_name", "").fillna("").astype(str)
+                    o["_text"] = (o["category"] + " " + o["sub_category"] + " " + o["line_item_name"]).str.lower()
+                    o["_amt"] = pd.to_numeric(o.get("amount"), errors="coerce").fillna(0.0).abs()
+
+                    # Identify operating expenses rows (exclude COGS/depreciation/interest/tax)
+                    opex_markers = "opex|operating expense|operating expenses|overhead|expense|expenses|administration|admin|selling|marketing|distribution"
+                    exclude_markers = "cogs|cost of|depreciation|amort|interest|tax|finance cost|finance costs"
+                    is_opex = o["_text"].str.contains(opex_markers, na=False) & ~o["_text"].str.contains(exclude_markers, na=False)
+                    opex_rows = o[is_opex].copy()
+                except Exception:
+                    opex_rows = period_df[
+                        period_df.get('category', '').astype(str).str.contains('Operating Expenses|OPEX', case=False, na=False)
+                    ].copy()
+
+                if opex_rows is not None and not opex_rows.empty:
+                    # Sum into canonical buckets using sub_category first, then line_item_name as fallback
+                    p = 0.0
+                    f = 0.0
+                    a = 0.0
+                    s = 0.0
+
+                    try:
+                        opex_rows = opex_rows.copy()
+                        opex_rows["_sub"] = opex_rows.get("sub_category", "").fillna("").astype(str).str.lower()
+                        opex_rows["_li"] = opex_rows.get("line_item_name", "").fillna("").astype(str).str.lower()
+                        opex_rows["_txt2"] = (opex_rows["_sub"] + " " + opex_rows["_li"]).str.strip()
+                        opex_rows["_amt2"] = pd.to_numeric(opex_rows.get("amount"), errors="coerce").fillna(0.0).abs()
+
+                        for txt, amt in zip(opex_rows["_txt2"].tolist(), opex_rows["_amt2"].tolist()):
+                            t = str(txt)
+                            if any(k in t for k in ["personnel", "salary", "salaries", "wage", "wages", "staff", "payroll"]):
+                                p += float(amt)
+                            elif any(k in t for k in ["facilities", "utility", "utilities", "rent", "lease", "electric", "water", "maintenance"]):
+                                f += float(amt)
+                            elif any(k in t for k in ["sales", "marketing", "advert", "advertising", "promotion", "commission"]):
+                                s += float(amt)
+                            elif any(k in t for k in ["admin", "administrative", "accounting", "audit", "legal", "office", "professional"]):
+                                a += float(amt)
+                            else:
+                                # Unclassified items go into "Other" via remainder logic below
+                                pass
+                    except Exception:
+                        p = f = a = s = 0.0
+
+                    # Reconcile to definitive total_opex (from imported statement) when present
+                    try:
+                        cur_total_opex = float(pd.to_numeric(monthly_data.loc[idx, "total_opex"], errors="coerce") or 0.0)
+                        cur_total_opex = abs(cur_total_opex)
+                    except Exception:
+                        cur_total_opex = 0.0
+
+                    subtotal = float(p + f + a + s)
+                    if cur_total_opex <= 0:
+                        cur_total_opex = subtotal
+                        # Only backfill total_opex when missing/zero
+                        if "total_opex" in monthly_data.columns and cur_total_opex != 0:
+                            monthly_data.loc[idx, "total_opex"] = cur_total_opex
+
+                    if subtotal > cur_total_opex and subtotal > 0:
+                        # Scale down proportionally when over-classified
+                        scale = cur_total_opex / subtotal if cur_total_opex > 0 else 0.0
+                        p *= scale
+                        f *= scale
+                        a *= scale
+                        s *= scale
+                        other = 0.0
+                    else:
+                        other = max(cur_total_opex - subtotal, 0.0)
+
+                    # Write back (overwrite for historical rows so sub_category is respected)
+                    if "opex_personnel" in monthly_data.columns:
+                        monthly_data.loc[idx, "opex_personnel"] = float(p)
+                    if "opex_facilities" in monthly_data.columns:
+                        monthly_data.loc[idx, "opex_facilities"] = float(f)
+                    if "opex_admin" in monthly_data.columns:
+                        monthly_data.loc[idx, "opex_admin"] = float(a)
+                    if "opex_sales" in monthly_data.columns:
+                        monthly_data.loc[idx, "opex_sales"] = float(s)
+                    if "opex_other" in monthly_data.columns:
+                        monthly_data.loc[idx, "opex_other"] = float(other)
                 
                 # -----------------------------------------------------------------
                 # Revenue line items (Installed Base model)
@@ -4787,32 +5137,37 @@ def _merge_detailed_line_items_into_monthly_data(
                             else:
                                 rev_service_existing += amt
 
-                    # Write back detail columns (only for actual rows; merge function is already scoped)
-                    if "rev_wear_existing" in monthly_data.columns and rev_wear_existing != 0:
-                        monthly_data.loc[idx, "rev_wear_existing"] = rev_wear_existing
-                    if "rev_service_existing" in monthly_data.columns and rev_service_existing != 0:
-                        monthly_data.loc[idx, "rev_service_existing"] = rev_service_existing
-                    if "rev_wear_prospect" in monthly_data.columns and rev_wear_prospect != 0:
-                        monthly_data.loc[idx, "rev_wear_prospect"] = rev_wear_prospect
-                    if "rev_service_prospect" in monthly_data.columns and rev_service_prospect != 0:
-                        monthly_data.loc[idx, "rev_service_prospect"] = rev_service_prospect
+                    # Only trust revenue detail extracted from imported line items if it *approximately*
+                    # reconciles back to the definitive total revenue for that period.
+                    existing_total = float(rev_wear_existing + rev_service_existing)
+                    prospect_total = float(rev_wear_prospect + rev_service_prospect)
+                    detail_total = existing_total + prospect_total
 
-                    # Derive subtotals when we have a segmented breakdown
-                    existing_total = rev_wear_existing + rev_service_existing
-                    prospect_total = rev_wear_prospect + rev_service_prospect
-                    if "revenue_existing" in monthly_data.columns and existing_total != 0:
-                        monthly_data.loc[idx, "revenue_existing"] = existing_total
-                    if "revenue_prospect" in monthly_data.columns and prospect_total != 0:
-                        monthly_data.loc[idx, "revenue_prospect"] = prospect_total
+                    cur_total_rev = 0.0
+                    try:
+                        if "total_revenue" in monthly_data.columns:
+                            cur_total_rev = float(pd.to_numeric(monthly_data.loc[idx, "total_revenue"], errors="coerce") or 0.0)
+                    except Exception:
+                        cur_total_rev = 0.0
 
-                    # If historical aggregate missed revenue entirely, backfill total_revenue from details
-                    if "total_revenue" in monthly_data.columns and (existing_total + prospect_total) != 0:
-                        try:
-                            cur_total = monthly_data.loc[idx, "total_revenue"]
-                            if pd.isna(cur_total) or float(cur_total) == 0.0:
-                                monthly_data.loc[idx, "total_revenue"] = existing_total + prospect_total
-                        except Exception:
-                            pass
+                    # Accept detail if it matches within 15% (or if total revenue is missing/zero)
+                    tol = max(abs(cur_total_rev) * 0.15, 100.0)
+                    apply_detail = (detail_total != 0.0) and (cur_total_rev == 0.0 or abs(detail_total - cur_total_rev) <= tol)
+
+                    if apply_detail:
+                        # Write back detail columns (even zeros, to avoid leaving stale split values)
+                        if "rev_wear_existing" in monthly_data.columns:
+                            monthly_data.loc[idx, "rev_wear_existing"] = float(rev_wear_existing)
+                        if "rev_service_existing" in monthly_data.columns:
+                            monthly_data.loc[idx, "rev_service_existing"] = float(rev_service_existing)
+                        if "rev_wear_prospect" in monthly_data.columns:
+                            monthly_data.loc[idx, "rev_wear_prospect"] = float(rev_wear_prospect)
+                        if "rev_service_prospect" in monthly_data.columns:
+                            monthly_data.loc[idx, "rev_service_prospect"] = float(rev_service_prospect)
+
+                        # If historical aggregate missed revenue entirely, backfill total_revenue from details
+                        if "total_revenue" in monthly_data.columns and cur_total_rev == 0.0 and detail_total != 0.0:
+                            monthly_data.loc[idx, "total_revenue"] = float(detail_total)
         
         return monthly_data
     
@@ -5472,6 +5827,61 @@ Configure in **AI Assumptions → Configure Assumptions**.
         ai_used = results.get('ai_assumptions_used', [])
         if ai_used:
             st.info(f"📊 Assumptions source: **{assumptions_source}** ({len(ai_used)} AI-derived values used)")
+
+        # Explainability: how assumptions were applied (helps catch contradictory settings)
+        try:
+            with st.expander("🧾 How this forecast was calculated (assumptions applied)", expanded=False):
+                meta = results.get("calculation_meta") or {}
+                fm = (meta.get("forecast_method") or results.get("forecast_method") or results.get("forecast_method_used") or "").strip() or "pipeline"
+                st.markdown(f"- **Forecast method**: `{fm}`")
+                st.markdown(f"- **Use trend layer**: `{bool(meta.get('use_trend_forecast', False))}`")
+
+                # Revenue guardrails
+                if isinstance(results.get("first_forecast_year_revenue_floor"), dict) and results["first_forecast_year_revenue_floor"].get("applied"):
+                    st.markdown("- **Revenue floor (FY1)**: `Applied`")
+                if isinstance(results.get("existing_customer_revenue_floor"), dict) and results["existing_customer_revenue_floor"].get("applied"):
+                    st.markdown("- **Existing customers revenue growth floor**: `Applied`")
+
+                st.markdown("---")
+                st.markdown("**COGS / Gross Margin**")
+                mc = meta.get("margin_consumable")
+                mr = meta.get("margin_refurb")
+                sc = meta.get("margin_consumable_source")
+                sr = meta.get("margin_refurb_source")
+                if mc is not None and mr is not None:
+                    st.markdown(f"- **Wear/Consumables margin used**: `{float(mc)*100:.1f}%` ({sc or 'unknown'})")
+                    st.markdown(f"- **Refurb/Service margin used**: `{float(mr)*100:.1f}%` ({sr or 'unknown'})")
+                st.markdown(f"- **COGS method**: `{meta.get('cogs_method', 'unknown')}`")
+                if results.get("summary", {}).get("manufacturing_included"):
+                    st.markdown(f"- **Manufacturing applied**: `True` ({results.get('summary', {}).get('manufacturing_strategy')})")
+                else:
+                    st.markdown("- **Manufacturing applied**: `False`")
+
+                st.markdown("---")
+                st.markdown("**OPEX / Overheads**")
+                st.markdown(f"- **OPEX method**: `{meta.get('opex_method', 'unknown')}`")
+                if meta.get("expense_items") is not None:
+                    st.markdown(f"- **Active expense items**: `{int(meta.get('expense_items') or 0)}`")
+                if meta.get("opex_pct_floor") is not None:
+                    st.markdown(f"- **OPEX % floor**: `{float(meta.get('opex_pct_floor'))*100:.1f}%` (source: `{meta.get('opex_pct_source')}`)")
+                if bool(meta.get("looks_like_setup_defaults")):
+                    st.warning(
+                        "Your `expense_assumptions` look like the Setup Wizard defaults (Personnel/Logistics/Professional/Facilities/Marketing). "
+                        "Those defaults are *not* intended to replace your imported historical overhead level."
+                    )
+
+                # Legacy trend configs presence (can surprise users in Hybrid/Trend)
+                try:
+                    assumptions_data = db.get_scenario_assumptions(scenario_id, user_id) if hasattr(db, "get_scenario_assumptions") else {}
+                    has_legacy = bool((assumptions_data.get("forecast_configs") or {}) or (assumptions_data.get("trend_forecasts") or {}))
+                    st.markdown("---")
+                    st.markdown(f"- **Legacy trend configs present**: `{has_legacy}`")
+                    if has_legacy and fm in ("pipeline", "Pipeline"):
+                        st.caption("Pipeline method ignores legacy trend configs. Hybrid/Trend may use them for COGS/OPEX if configured.")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         
         # Quick summary
         summary = results.get('summary', {})
@@ -5548,10 +5958,11 @@ def render_results_tab(db, scenario_id: str, user_id: str):
                 
                 col1, col2, col3 = st.columns(3)
                 with col1:
+                    # historic_financials is a *legacy* summary table; detailed line-items are the primary source now.
                     if hf_count > 0:
-                        st.success(f"✅ historic_financials: {hf_count} rows")
+                        st.success(f"✅ historic_financials (legacy): {hf_count} rows")
                     else:
-                        st.error("❌ historic_financials: Empty")
+                        st.info("ℹ️ historic_financials (legacy): Empty (OK if using line items)")
                 with col2:
                     if he_count > 0:
                         st.success(f"✅ expense_categories: {he_count} rows")
@@ -5563,7 +5974,8 @@ def render_results_tab(db, scenario_id: str, user_id: str):
                     else:
                         st.warning("⚠️ line_items: Empty")
                 
-                if hf_count == 0 and he_count == 0 and li_count == 0:
+                # Only treat as "no historics" when line items are also empty.
+                if li_count == 0 and hf_count == 0 and he_count == 0:
                     st.error("""
 **⚠️ No historical data in database!**
 
